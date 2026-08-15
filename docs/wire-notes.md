@@ -64,3 +64,25 @@ Two things the probe hard-codes that a real client must not:
 The server's final message carries `v=<ServerSignature>`, which a correct client
 **verifies** — it is what proves the server also knew the stored key, i.e. that
 you are not talking to an impostor. The probe does not check it; the client must.
+
+## What building the client added to this list
+
+* **The probe's two fakes and its one omission are all closed.** `lib.milo` draws
+  the nonce from `std/random` per connection, takes the password from the DSN, and
+  verifies the server's `v=` ServerSignature. That last check is live, not
+  decorative: comparing it against the *client* signature instead makes
+  `testConnectOverScram` fail with "server signature mismatch", which is how it
+  was confirmed to be load-bearing.
+* **An `ErrorResponse` is not the end of the exchange.** The server still owes a
+  `ReadyForQuery`, and returning the error without reading it desynchronises every
+  later query on that connection — the next query gets the previous one's tail.
+  The client holds the error and returns it only after `ReadyForQuery` arrives.
+* **`pg_hba.conf` is first-match-wins**, which is the whole trick to exercising
+  more than one authentication method against one cluster: a per-role line for
+  `md5` and one for `password`, both ahead of the `scram-sha-256` catch-all.
+  `password_encryption` decides how the verifier is *stored*, so it has to be
+  `md5` when the role is created for the `md5` method to work at all.
+* **`test-server.sh start` must stop the old cluster before deleting its data
+  dir.** Deleting it out from under a live postmaster leaves the process running
+  and holding the port; the next `pg_ctl start` then fails with nothing but
+  "could not start server".
