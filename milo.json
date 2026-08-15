@@ -1,0 +1,10 @@
+{
+  "name": "postgres",
+  "version": "0.1.0",
+  "description": "PostgreSQL client — wire protocol v3, SCRAM-SHA-256, extended query, pure Milo",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-postgres",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux"],
+  "exclude": ["tests/**", "examples/**", "scripts/**"]
+}
