@@ -1,0 +1,1961 @@
+// milo-postgres — a PostgreSQL client for Milo, speaking wire protocol v3 directly.
+//
+// No libpq: the whole exchange is framed bytes on a socket, so the only dependency
+// is std. Milo's `string` is an owned byte buffer that carries embedded NULs
+// unharmed, which is what makes it usable as the wire buffer type here — see
+// docs/wire-notes.md for the probe that established that.
+//
+//   var c = Conn.connect("postgres://user:pw@127.0.0.1:5432/app")!
+//   let rows = c.query("select id, name from users")!
+//   for row in rows.all() {
+//       print((row.i64("id") ?? 0).toString() + " " + (row.str("name") ?? ""))
+//   }
+//   c.close()
+//
+// Values come back in the protocol's TEXT format and are decoded per column OID.
+// Binary format would save a parse on ints and floats; it is a later optimisation
+// and deliberately not v0.1 (see README "Not implemented").
+
+from "std/net" import {
+    TcpStream, NetError, resolve
+}
+from "std/fetch" import {
+    TlsStream
+}
+from "std/binary" import {
+    Bytes
+}
+from "std/hmac" import {
+    Hmac
+}
+from "std/sha256" import {
+    Sha256
+}
+from "std/pbkdf2" import {
+    Pbkdf2
+}
+from "std/base64" import {
+    Base64
+}
+from "std/crypto" import {
+    Crypto
+}
+from "std/random" import {
+    Random
+}
+from "std/subtle" import {
+    constantTimeEq
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+// A PostgreSQL ErrorResponse, decoded field by field.
+//
+// Collapsing this to a bare string is the thing that makes a client annoying to
+// use: `code` is the SQLSTATE, which is stable across server versions and locales
+// and is the only part a program should ever branch on. `message` is localised and
+// may be reworded by a minor release, so matching on its text is a latent bug.
+//
+// Client-side failures (DNS, connect, framing) are reported through this same type
+// so callers have one error to handle, with a SQLSTATE from the connection classes:
+// `08000` connection_exception and `08P01` protocol_violation.
+pub struct PgError {
+    severity: string,
+    code: string,
+    message: string,
+    detail: string,
+    hint: string,
+    position: i32,
+    context: string,
+    schema: string,
+    table: string,
+    column: string,
+    constraint: string,
+    routine: string,
+}
+
+impl PgError {
+    fn empty(): PgError {
+        return PgError {
+            severity: "", code: "", message: "", detail: "", hint: "",
+            position: 0 as i32, context: "", schema: "", table: "",
+            column: "", constraint: "", routine: ""
+        }
+    }
+
+    // A failure on our side of the socket: DNS, connect, TLS, a closed connection.
+    fn client(message: &string): PgError {
+        var e = PgError.empty()
+        e.severity = "FATAL"
+        e.code = "08000"
+        e.message = message.clone()
+        return e
+    }
+
+    // The server said something we cannot parse, or said it out of order.
+    fn protocol(message: &string): PgError {
+        var e = PgError.empty()
+        e.severity = "FATAL"
+        e.code = "08P01"
+        e.message = message.clone()
+        return e
+    }
+
+    fn toString(self: &Self): string {
+        var out: string = ""
+        out.pushStr(if self.severity.len > 0 {
+            self.severity.clone()
+        } else {
+            "ERROR"
+        }
+        )
+        if self.code.len > 0 {
+            out.pushStr(" [")
+            out.pushStr(self.code)
+            out.pushStr("]")
+        }
+        out.pushStr(": ")
+        out.pushStr(self.message)
+        if self.detail.len > 0 {
+            out.pushStr("\nDETAIL: ")
+            out.pushStr(self.detail)
+        }
+        if self.hint.len > 0 {
+            out.pushStr("\nHINT: ")
+            out.pushStr(self.hint)
+        }
+        if self.position > 0 as i32 {
+            out.pushStr("\nPOSITION: ")
+            out.pushStr(self.position.toString())
+        }
+        return out
+    }
+}
+
+// Decode an ErrorResponse / NoticeResponse body: a run of (field-code byte,
+// NUL-terminated value) pairs, ended by a zero field code.
+fn decodeErrorFields(body: &string): PgError {
+    var e = PgError.empty()
+    var i: i64 = 0
+    while i < body.len {
+        let code = body[i]
+        if code == 0 as u8 {
+            break
+        }
+        i = i + 1
+        var v: string = ""
+        while i < body.len && body[i] != 0 as u8 {
+            v.push(body[i])
+            i = i + 1
+        }
+        i = i + 1
+        // 'S' is localised; 'V' is the same severity in English and only exists on
+        // servers >= 9.6, so 'S' is read first and 'V' overwrites it when present.
+        if code == 'S' {
+            e.severity = v
+        } else if code == 'V' {
+            e.severity = v
+        } else if code == 'C' {
+            e.code = v
+        } else if code == 'M' {
+            e.message = v
+        } else if code == 'D' {
+            e.detail = v
+        } else if code == 'H' {
+            e.hint = v
+        } else if code == 'P' {
+            e.position = (v.parseInt() ?? 0) as i32
+        } else if code == 'W' {
+            e.context = v
+        } else if code == 's' {
+            e.schema = v
+        } else if code == 't' {
+            e.table = v
+        } else if code == 'c' {
+            e.column = v
+        } else if code == 'n' {
+            e.constraint = v
+        } else if code == 'R' {
+            e.routine = v
+        }
+    }
+    return e
+}
+
+// ── Values ───────────────────────────────────────────────────────────────────
+
+// A single cell. `Bytes` is raw bytes (bytea); `Text` covers every type this
+// version does not give a narrower representation, including numeric, dates and
+// json — see decodeValue for why each one lands where it does.
+pub enum PgValue {
+    Null,
+    Int(i64),
+    Float(f64),
+    Text(string),
+    Bool(bool),
+    Bytes(string),
+}
+
+impl PgValue {
+    // Enums get no auto-derived clone in Milo, and a result set has to hand out
+    // owned values (references are second-class, so a borrowed cell could not be
+    // returned). Rebuilding the variant is that clone.
+    fn clone(self: &Self): PgValue {
+        match self {
+            PgValue.Null => {
+                return PgValue.Null
+            }
+            PgValue.Int(n) => {
+                return PgValue.Int(n)
+            }
+            PgValue.Float(f) => {
+                return PgValue.Float(f)
+            }
+            PgValue.Text(s) => {
+                return PgValue.Text(s.clone())
+            }
+            PgValue.Bool(b) => {
+                return PgValue.Bool(b)
+            }
+            PgValue.Bytes(b) => {
+                return PgValue.Bytes(b.clone())
+            }
+        }
+    }
+
+    fn isNull(self: &Self): bool {
+        match self {
+            PgValue.Null => {
+                return true
+            }
+            _ => {
+                return false
+            }
+        }
+    }
+
+    // Render for the wire in text format. Only called for bind parameters, and
+    // never for Null — a NULL parameter is signalled by a -1 length, not by text.
+    fn toWire(self: &Self): string {
+        match self {
+            PgValue.Null => {
+                return ""
+            }
+            PgValue.Int(n) => {
+                return n.toString()
+            }
+            PgValue.Float(f) => {
+                return f.toString()
+            }
+            PgValue.Text(s) => {
+                return s.clone()
+            }
+            PgValue.Bool(b) => {
+                return if b {
+                    "true"
+                } else {
+                    "false"
+                }
+            }
+            PgValue.Bytes(b) => {
+                // bytea's text input format. `\x` + hex is unambiguous and, unlike
+                // the legacy escape format, does not depend on bytea_output.
+                var out: string = "\\x"
+                out.pushStr(hexEncode(b))
+                return out
+            }
+        }
+    }
+
+    // Human-readable rendering, for printing a result set.
+    fn toString(self: &Self): string {
+        match self {
+            PgValue.Null => {
+                return "NULL"
+            }
+            PgValue.Int(n) => {
+                return n.toString()
+            }
+            PgValue.Float(f) => {
+                return f.toString()
+            }
+            PgValue.Text(s) => {
+                return s.clone()
+            }
+            PgValue.Bool(b) => {
+                return b.toString()
+            }
+            PgValue.Bytes(b) => {
+                var out: string = "\\x"
+                out.pushStr(hexEncode(b))
+                return out
+            }
+        }
+    }
+}
+
+// ── Type OIDs ────────────────────────────────────────────────────────────────
+//
+// pg_type.oid for the types this client decodes. They are frozen constants in
+// PostgreSQL's catalog, not version-dependent, so hardcoding them is correct.
+pub let OID_BOOL: i32 = 16 as i32
+
+pub let OID_BYTEA: i32 = 17 as i32
+
+pub let OID_CHAR: i32 = 18 as i32
+
+pub let OID_NAME: i32 = 19 as i32
+
+pub let OID_INT8: i32 = 20 as i32
+
+pub let OID_INT2: i32 = 21 as i32
+
+pub let OID_INT4: i32 = 23 as i32
+
+pub let OID_TEXT: i32 = 25 as i32
+
+pub let OID_OID: i32 = 26 as i32
+
+pub let OID_JSON: i32 = 114 as i32
+
+pub let OID_FLOAT4: i32 = 700 as i32
+
+pub let OID_FLOAT8: i32 = 701 as i32
+
+pub let OID_BPCHAR: i32 = 1042 as i32
+
+pub let OID_VARCHAR: i32 = 1043 as i32
+
+pub let OID_DATE: i32 = 1082 as i32
+
+pub let OID_TIME: i32 = 1083 as i32
+
+pub let OID_TIMESTAMP: i32 = 1114 as i32
+
+pub let OID_TIMESTAMPTZ: i32 = 1184 as i32
+
+pub let OID_NUMERIC: i32 = 1700 as i32
+
+pub let OID_UUID: i32 = 2950 as i32
+
+pub let OID_JSONB: i32 = 3802 as i32
+
+// Turn a text-format field into a PgValue, using the column's type OID.
+//
+// The types that stay `Text` do so on purpose, not by omission:
+//   numeric      — arbitrary precision. f64 would silently round 0.1 and lose
+//                  digits past 17; the decimal string is the exact value.
+//   date/time*   — Milo's std/datetime models instants, not PostgreSQL's four
+//                  distinct temporal types; a lossy conversion is worse than the
+//                  server's own ISO rendering, which round-trips on input.
+//   uuid         — canonical 8-4-4-4-12 text, which is what callers compare and
+//                  print. A 16-byte form buys nothing at text-format speeds.
+//   json/jsonb   — handed to std/json by the caller if they want a tree; parsing
+//                  every row eagerly would be a cost the caller did not ask for.
+fn decodeValue(oid: i32, text: &string): PgValue {
+    if oid == OID_BOOL {
+        return PgValue.Bool(text.len > 0 && text[0] == 't')
+    }
+    if oid == OID_BYTEA {
+        return PgValue.Bytes(decodeBytea(text))
+    }
+    if oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8 || oid == OID_OID {
+        // A value that does not parse is not silently zeroed: an int column whose
+        // text we cannot read is a protocol surprise, and Text keeps it visible.
+        match text.parseInt() {
+            Option.Some(n) => {
+                return PgValue.Int(n)
+            }
+            Option.None => {
+                return PgValue.Text(text.clone())
+            }
+        }
+    }
+    if oid == OID_FLOAT4 || oid == OID_FLOAT8 {
+        match text.parseF64() {
+            Option.Some(f) => {
+                return PgValue.Float(f)
+            }
+            Option.None => {
+                // NaN / Infinity / -Infinity arrive as those words.
+                return PgValue.Text(text.clone())
+            }
+        }
+    }
+    return PgValue.Text(text.clone())
+}
+
+// bytea in text format. Modern servers emit `\x<hex>`; `bytea_output = escape`
+// still exists, so the legacy form is decoded too rather than handed back raw.
+fn decodeBytea(text: &string): string {
+    if text.len >= 2 && text[0] == '\\' && text[1] == 'x' {
+        var out: string = ""
+        var i: i64 = 2
+        while i + 1 < text.len {
+            out.push(((hexVal(text[i]) << 4) | hexVal(text[i + 1])) as u8)
+            i = i + 2
+        }
+        return out
+    }
+    var out: string = ""
+    var i: i64 = 0
+    while i < text.len {
+        if text[i] == '\\' && i + 1 < text.len {
+            if text[i + 1] == '\\' {
+                out.push('\\')
+                i = i + 2
+            } else if i + 3 < text.len {
+                let v = ((text[i + 1] - '0') as i64) * 64 + ((text[i + 2] - '0') as i64) * 8 + ((text[i + 3] - '0') as i64)
+                out.push(v as u8)
+                i = i + 4
+            } else {
+                out.push(text[i])
+                i = i + 1
+            }
+        } else {
+            out.push(text[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn hexVal(c: u8): u8 {
+    if c >= '0' && c <= '9' {
+        return c - '0'
+    }
+    if c >= 'a' && c <= 'f' {
+        return c - 'a' + 10 as u8
+    }
+    if c >= 'A' && c <= 'F' {
+        return c - 'A' + 10 as u8
+    }
+    return 0 as u8
+}
+
+fn hexEncode(raw: &string): string {
+    let digits = "0123456789abcdef"
+    var out: string = ""
+    for b in raw {
+        out.push(digits[(b >> 4) as i64])
+        out.push(digits[(b & 15 as u8) as i64])
+    }
+    return out
+}
+
+// ── Result sets ──────────────────────────────────────────────────────────────
+
+// One row, detached from the result set it came from.
+//
+// It carries its own copy of the column names so it stays usable after the `Rows`
+// is gone — Milo references are second-class, so a row that borrowed its header
+// could not be stored, returned, or put in a Vec. When that copy matters, index
+// `Rows` directly with `rows.str(r, "name")` and skip building a Row at all.
+pub struct Row {
+    cols: Vec<string>,
+    values: Vec<PgValue>,
+}
+
+impl Row {
+    fn len(self: &Self): i64 {
+        return self.values.len()
+    }
+
+    fn columns(self: &Self): Vec<string> {
+        return self.cols.clone()
+    }
+
+    fn indexOf(self: &Self, name: &string): Option<i64> {
+        for i in 0..self.cols.len() {
+            if self.cols[i] == name {
+                return Option.Some(i)
+            }
+        }
+        return Option.None
+    }
+
+    fn valueAt(self: &Self, c: i64): PgValue {
+        if c < 0 || c >= self.values.len() {
+            return PgValue.Null
+        }
+        return self.values[c].clone()
+    }
+
+    fn value(self: &Self, name: &string): PgValue {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.valueAt(c)
+            }
+            Option.None => {
+                return PgValue.Null
+            }
+        }
+    }
+
+    // NULL and the empty string are distinct here, and stay distinct all the way
+    // out: a NULL text column answers None, an empty one answers Some("").
+    fn isNullAt(self: &Self, c: i64): bool {
+        if c < 0 || c >= self.values.len() {
+            return true
+        }
+        return self.values[c].isNull()
+    }
+
+    fn isNull(self: &Self, name: &string): bool {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.isNullAt(c)
+            }
+            Option.None => {
+                return true
+            }
+        }
+    }
+
+    fn strAt(self: &Self, c: i64): Option<string> {
+        if c < 0 || c >= self.values.len() {
+            return Option.None
+        }
+        match self.values[c] {
+            PgValue.Null => {
+                return Option.None
+            }
+            _ => {
+                return Option.Some(self.values[c].toString())
+            }
+        }
+    }
+
+    fn str(self: &Self, name: &string): Option<string> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.strAt(c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn i64At(self: &Self, c: i64): Option<i64> {
+        if c < 0 || c >= self.values.len() {
+            return Option.None
+        }
+        match self.values[c] {
+            PgValue.Int(n) => {
+                return Option.Some(n)
+            }
+            PgValue.Text(s) => {
+                return s.parseInt()
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn i64(self: &Self, name: &string): Option<i64> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.i64At(c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn f64At(self: &Self, c: i64): Option<f64> {
+        if c < 0 || c >= self.values.len() {
+            return Option.None
+        }
+        match self.values[c] {
+            PgValue.Float(f) => {
+                return Option.Some(f)
+            }
+            PgValue.Int(n) => {
+                return Option.Some(n as f64)
+            }
+            // numeric arrives as Text on purpose (exactness); widening it here is
+            // the caller explicitly asking for the lossy read.
+            PgValue.Text(s) => {
+                return s.parseF64()
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn f64(self: &Self, name: &string): Option<f64> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.f64At(c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn boolAt(self: &Self, c: i64): Option<bool> {
+        if c < 0 || c >= self.values.len() {
+            return Option.None
+        }
+        match self.values[c] {
+            PgValue.Bool(b) => {
+                return Option.Some(b)
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn bool(self: &Self, name: &string): Option<bool> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.boolAt(c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    // Raw bytes of a bytea column, already un-escaped.
+    fn bytesAt(self: &Self, c: i64): Option<string> {
+        if c < 0 || c >= self.values.len() {
+            return Option.None
+        }
+        match self.values[c] {
+            PgValue.Bytes(b) => {
+                return Option.Some(b.clone())
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn bytes(self: &Self, name: &string): Option<string> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.bytesAt(c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+}
+
+// A result set: the column header plus every row, cells stored row-major in one
+// flat Vec (std/json's pool shape — one contiguous allocation, cheap to clone).
+//
+// A simple query may run several statements. When a second RowDescription arrives
+// the header and rows RESET: the shapes differ, so concatenating them would
+// produce a table with no consistent meaning. `commands` still lists every
+// CommandComplete tag in order, so the whole batch stays observable, and
+// `affected` sums them. In short: for a multi-statement batch, `Rows` is the last
+// result set and `commands` is the record of the rest.
+pub struct Rows {
+    cols: Vec<string>,
+    oids: Vec<i32>,
+    cells: Vec<PgValue>,
+    nrows: i64,
+    commands: Vec<string>,
+    affected: i64,
+}
+
+impl Rows {
+    fn empty(): Rows {
+        return Rows {
+            cols: Vec.new(), oids: Vec.new(), cells: Vec.new(),
+            nrows: 0, commands: Vec.new(), affected: 0
+        }
+    }
+
+    fn len(self: &Self): i64 {
+        return self.nrows
+    }
+
+    fn width(self: &Self): i64 {
+        return self.cols.len()
+    }
+
+    fn columns(self: &Self): Vec<string> {
+        return self.cols.clone()
+    }
+
+    // Column type OIDs, parallel to columns(). Useful for a generic printer.
+    fn oidAt(self: &Self, c: i64): i32 {
+        if c < 0 || c >= self.oids.len() {
+            return 0 as i32
+        }
+        return self.oids[c]
+    }
+
+    // CommandComplete tags for every statement in the batch, e.g. "SELECT 3".
+    fn commandTags(self: &Self): Vec<string> {
+        return self.commands.clone()
+    }
+
+    // Total rows affected across the batch, as reported by CommandComplete.
+    fn affectedRows(self: &Self): i64 {
+        return self.affected
+    }
+
+    fn indexOf(self: &Self, name: &string): Option<i64> {
+        for i in 0..self.cols.len() {
+            if self.cols[i] == name {
+                return Option.Some(i)
+            }
+        }
+        return Option.None
+    }
+
+    fn cellIndex(self: &Self, r: i64, c: i64): i64 {
+        if r < 0 || r >= self.nrows || c < 0 || c >= self.cols.len() {
+            return -1
+        }
+        return r * self.cols.len() + c
+    }
+
+    fn valueAt(self: &Self, r: i64, c: i64): PgValue {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return PgValue.Null
+        }
+        return self.cells[i].clone()
+    }
+
+    fn value(self: &Self, r: i64, name: &string): PgValue {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.valueAt(r, c)
+            }
+            Option.None => {
+                return PgValue.Null
+            }
+        }
+    }
+
+    fn isNullAt(self: &Self, r: i64, c: i64): bool {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return true
+        }
+        return self.cells[i].isNull()
+    }
+
+    fn isNull(self: &Self, r: i64, name: &string): bool {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.isNullAt(r, c)
+            }
+            Option.None => {
+                return true
+            }
+        }
+    }
+
+    fn strAt(self: &Self, r: i64, c: i64): Option<string> {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return Option.None
+        }
+        match self.cells[i] {
+            PgValue.Null => {
+                return Option.None
+            }
+            _ => {
+                return Option.Some(self.cells[i].toString())
+            }
+        }
+    }
+
+    fn str(self: &Self, r: i64, name: &string): Option<string> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.strAt(r, c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn i64At(self: &Self, r: i64, c: i64): Option<i64> {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return Option.None
+        }
+        match self.cells[i] {
+            PgValue.Int(n) => {
+                return Option.Some(n)
+            }
+            PgValue.Text(s) => {
+                return s.parseInt()
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn i64(self: &Self, r: i64, name: &string): Option<i64> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.i64At(r, c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn f64At(self: &Self, r: i64, c: i64): Option<f64> {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return Option.None
+        }
+        match self.cells[i] {
+            PgValue.Float(f) => {
+                return Option.Some(f)
+            }
+            PgValue.Int(n) => {
+                return Option.Some(n as f64)
+            }
+            PgValue.Text(s) => {
+                return s.parseF64()
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn f64(self: &Self, r: i64, name: &string): Option<f64> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.f64At(r, c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn boolAt(self: &Self, r: i64, c: i64): Option<bool> {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return Option.None
+        }
+        match self.cells[i] {
+            PgValue.Bool(b) => {
+                return Option.Some(b)
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn bool(self: &Self, r: i64, name: &string): Option<bool> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.boolAt(r, c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn bytesAt(self: &Self, r: i64, c: i64): Option<string> {
+        let i = self.cellIndex(r, c)
+        if i < 0 {
+            return Option.None
+        }
+        match self.cells[i] {
+            PgValue.Bytes(b) => {
+                return Option.Some(b.clone())
+            }
+            _ => {
+                return Option.None
+            }
+        }
+    }
+
+    fn bytes(self: &Self, r: i64, name: &string): Option<string> {
+        match self.indexOf(name) {
+            Option.Some(c) => {
+                return self.bytesAt(r, c)
+            }
+            Option.None => {
+                return Option.None
+            }
+        }
+    }
+
+    fn at(self: &Self, r: i64): Row {
+        var values: Vec<PgValue> = Vec.new()
+        for c in 0..self.cols.len() {
+            values.push(self.valueAt(r, c))
+        }
+        return Row {
+            cols: self.cols.clone(), values: values
+        }
+    }
+
+    // Every row as owned values, for `for row in rows.all()`.
+    fn all(self: &Self): Vec<Row> {
+        var out: Vec<Row> = Vec.new()
+        for r in 0..self.nrows {
+            out.push(self.at(r))
+        }
+        return out
+    }
+
+    // A RowDescription starts a result set. A second one in the same batch REPLACES
+    // the first — see the struct comment for why concatenating would be wrong.
+    fn setDescription(self: &mut Self, body: &string): void {
+        self.cols = Vec.new()
+        self.oids = Vec.new()
+        self.cells = Vec.new()
+        self.nrows = 0
+        let n = ((Bytes.readI16Be(body, 0) ?? 0 as i16) as i64)
+        var off: i64 = 2
+        for f in 0..n {
+            let name = readCString(body, off)
+            // name\0 then: tableOid i32, columnNumber i16, typeOid i32,
+            // typeSize i16, typeModifier i32, formatCode i16 = 18 bytes.
+            off = off + name.len + 1
+            let oid = Bytes.readI32Be(body, off + 6) ?? 0 as i32
+            off = off + 18
+            self.cols.push(name)
+            self.oids.push(oid)
+        }
+    }
+
+    fn addRow(self: &mut Self, body: &string): void {
+        let n = ((Bytes.readI16Be(body, 0) ?? 0 as i16) as i64)
+        var off: i64 = 2
+        for c in 0..n {
+            let len = ((Bytes.readI32Be(body, off) ?? -1 as i32) as i64)
+            off = off + 4
+            if len < 0 {
+                self.cells.push(PgValue.Null)
+            } else {
+                let text = body.substr(off, off + len)
+                let oid = if c < self.oids.len() {
+                    self.oids[c]
+                } else {
+                    OID_TEXT
+                }
+                self.cells.push(decodeValue(oid, text))
+                off = off + len
+            }
+        }
+        // Keep the flat cell array rectangular whatever the server sent, so the
+        // row-major index arithmetic can never read a neighbouring row's cell.
+        while self.cells.len() < (self.nrows + 1) * self.cols.len() {
+            self.cells.push(PgValue.Null)
+        }
+        self.nrows = self.nrows + 1
+    }
+}
+
+// ── Connection string ────────────────────────────────────────────────────────
+
+// A parsed `postgres://` URL. Public so a caller can inspect or build one without
+// string surgery, and so the DSN rules are testable on their own.
+pub struct Dsn {
+    host: string,
+    port: u16,
+    user: string,
+    password: string,
+    database: string,
+    sslmode: string,
+    sslrootcert: string,
+    appName: string,
+}
+
+// Percent-decoding, applied to the userinfo and path components. A password with
+// an `@` or `/` in it is common and has to be written `%40` / `%2F` in a URL; not
+// decoding it produces an authentication failure with no clue why.
+fn percentDecode(s: &string): string {
+    var out: string = ""
+    var i: i64 = 0
+    while i < s.len {
+        if s[i] == '%' && i + 2 < s.len {
+            out.push(((hexVal(s[i + 1]) << 4) | hexVal(s[i + 2])) as u8)
+            i = i + 3
+        } else {
+            out.push(s[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// libpq's six. `verify-ca` and `verify-full` are accepted as spellings of what
+// this client already does — it cannot encrypt without verifying (see negotiateTls).
+fn isKnownSslmode(mode: &string): bool {
+    return mode == "disable" || mode == "allow" || mode == "prefer"
+    || mode == "require" || mode == "verify-ca" || mode == "verify-full"
+}
+
+// Parse `postgres://user:password@host:port/database?k=v&k=v`.
+//
+// Recognised query parameters: `sslmode`, `sslrootcert`, `application_name`.
+// Anything else is ignored rather than rejected — a DSN is often shared with other
+// tools, and failing on a parameter meant for someone else helps nobody.
+pub fn parseDsn(dsn: &string): Result<Dsn, PgError> {
+    var out = Dsn {
+        host: "127.0.0.1", port: 5432 as u16, user: "postgres", password: "",
+        database: "", sslmode: "disable", sslrootcert: "", appName: "milo-postgres"
+    }
+    let sep = dsn.indexOf("://")
+    let Option.Some(schemeEnd) = sep else {
+        return Result.Err(PgError.client("invalid DSN: expected postgres://user:password@host:port/database"))
+    }
+    let scheme = dsn.substr(0, schemeEnd)
+    if scheme != "postgres" && scheme != "postgresql" {
+        return Result.Err(PgError.client("invalid DSN scheme '" + scheme + "': expected postgres:// or postgresql://"))
+    }
+    var rest = dsn.substr(schemeEnd + 3, dsn.len)
+
+    // query string
+    var query: string = ""
+    match rest.indexOf("?") {
+        Option.Some(q) => {
+            query = rest.substr(q + 1, rest.len)
+            rest = rest.substr(0, q)
+        }
+        Option.None => {
+        }
+    }
+
+    // path = database
+    match rest.indexOf("/") {
+        Option.Some(p) => {
+            out.database = percentDecode(rest.substr(p + 1, rest.len))
+            rest = rest.substr(0, p)
+        }
+        Option.None => {
+        }
+    }
+
+    // userinfo — split on the LAST '@', because a password may legitimately
+    // contain one when it was not percent-encoded.
+    match rest.lastIndexOf("@") {
+        Option.Some(at) => {
+            let userinfo = rest.substr(0, at)
+            rest = rest.substr(at + 1, rest.len)
+            match userinfo.indexOf(":") {
+                Option.Some(c) => {
+                    out.user = percentDecode(userinfo.substr(0, c))
+                    out.password = percentDecode(userinfo.substr(c + 1, userinfo.len))
+                }
+                Option.None => {
+                    out.user = percentDecode(userinfo)
+                }
+            }
+        }
+        Option.None => {
+        }
+    }
+
+    // host:port
+    if rest.len > 0 {
+        if rest[0] == '[' {
+            return Result.Err(PgError.client("IPv6 literals in a DSN are not supported in v0.1"))
+        }
+        match rest.lastIndexOf(":") {
+            Option.Some(c) => {
+                let portText = rest.substr(c + 1, rest.len)
+                let Option.Some(p) = portText.parseInt() else {
+                    return Result.Err(PgError.client("invalid DSN port '" + portText + "'"))
+                }
+                if p <= 0 || p > 65535 {
+                    return Result.Err(PgError.client("invalid DSN port '" + portText + "'"))
+                }
+                out.port = p as u16
+                out.host = rest.substr(0, c)
+            }
+            Option.None => {
+                out.host = rest.clone()
+            }
+        }
+    }
+    if out.host.len == 0 {
+        out.host = "127.0.0.1"
+    }
+    // libpq's rule: an omitted database name means "same as the user".
+    if out.database.len == 0 {
+        out.database = out.user.clone()
+    }
+
+    for pair in query.split("&") {
+        if pair.len == 0 {
+            continue
+        }
+        var k = pair.clone()
+        var v: string = ""
+        match pair.indexOf("=") {
+            Option.Some(e) => {
+                k = pair.substr(0, e)
+                v = percentDecode(pair.substr(e + 1, pair.len))
+            }
+            Option.None => {
+            }
+        }
+        if k == "sslmode" {
+            out.sslmode = v
+        } else if k == "sslrootcert" {
+            out.sslrootcert = v
+        } else if k == "application_name" {
+            out.appName = v
+        }
+    }
+    if !isKnownSslmode(out.sslmode) {
+        return Result.Err(PgError.client("unknown sslmode '" + out.sslmode + "': expected disable, allow, prefer, require, verify-ca or verify-full"))
+    }
+    return Result.Ok(out)
+}
+
+// ── Transport ────────────────────────────────────────────────────────────────
+
+struct PgMsg {
+    tag: u8,
+    body: string,
+}
+
+// The socket plus a read buffer, so a caller never sees a half message.
+//
+// `tls` is None until an SSLRequest is accepted; at that point the TcpStream's fd
+// is handed over with `take()` (which sets it to -1) so exactly one of the two
+// owns the descriptor and it cannot be double-closed.
+struct PgStream {
+    tcp: TcpStream,
+    tls: Option<TlsStream>,
+    buf: string,
+    pos: i64,
+}
+
+impl PgStream {
+    fn wrap(tcp: TcpStream): PgStream {
+        return PgStream {
+            tcp: tcp, tls: Option.None, buf: "", pos: 0
+        }
+    }
+
+    // Write every byte. A single send() is allowed to write short — a large Bind
+    // with a megabyte parameter will — so the loop is not optional.
+    fn sendAll(self: &Self, data: &string): Result<Unit, PgError> {
+        var sent: i64 = 0
+        while sent < data.len {
+            // The whole-buffer case is the common one and copies nothing; only a
+            // short write pays for a tail copy (a &string view cannot be passed to
+            // send, which wants a place it can borrow).
+            var chunk: string = ""
+            if sent > 0 {
+                chunk = data.substr(sent, data.len)
+            }
+            var n: i64 = 0
+            if let Option.Some(t) = self.tls {
+                n = if sent == 0 {
+                    t.send(data) ?? -1
+                } else {
+                    t.send(chunk) ?? -1
+                }
+            } else {
+                n = if sent == 0 {
+                    self.tcp.send(data) ?? -1
+                } else {
+                    self.tcp.send(chunk) ?? -1
+                }
+            }
+            if n <= 0 {
+                return Result.Err(PgError.client("send failed: connection lost"))
+            }
+            sent = sent + n
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // One read into the buffer. False means the peer closed.
+    fn fill(self: &mut Self): bool {
+        var chunk: string = ""
+        if let Option.Some(t) = self.tls {
+            chunk = t.recvOnce()
+        } else {
+            chunk = self.tcp.recvOnce()
+        }
+        if chunk.len == 0 {
+            return false
+        }
+        self.buf.pushStr(chunk)
+        return true
+    }
+
+    fn ensure(self: &mut Self, n: i64): bool {
+        while self.buf.len - self.pos < n {
+            if !self.fill() {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Drop the consumed prefix at a message boundary, so a long-lived connection
+    // does not accumulate every byte it ever read. Only above a threshold: the
+    // copy costs more than the memory below it.
+    fn compact(self: &mut Self): void {
+        if self.pos == self.buf.len {
+            self.buf = ""
+            self.pos = 0
+        } else if self.pos > 65536 {
+            let rest = self.buf.substr(self.pos, self.buf.len)
+            self.buf = rest
+            self.pos = 0
+        }
+    }
+
+    fn readMsg(self: &mut Self): Result<PgMsg, PgError> {
+        if !self.ensure(5) {
+            return Result.Err(PgError.client("connection closed by server"))
+        }
+        let tag = self.buf[self.pos]
+        let len = Bytes.readI32Be(self.buf, self.pos + 1) ?? 0 as i32
+        // A corrupt or hostile length would otherwise make ensure() read forever.
+        // 1 GiB is far above any real message and far below anything that could
+        // exhaust memory before the read failed.
+        if (len as i64) < 4 || (len as i64) > 1073741824 {
+            return Result.Err(PgError.protocol("bad message length " + len.toString()))
+        }
+        let total = 1 + (len as i64)
+        if !self.ensure(total) {
+            return Result.Err(PgError.client("connection closed mid-message"))
+        }
+        let body = self.buf.substr(self.pos + 5, self.pos + total)
+        self.pos = self.pos + total
+        self.compact()
+        return Result.Ok(PgMsg {
+            tag: tag, body: body
+        }
+        )
+    }
+
+    // Close the socket. Assigning over the fields runs the old values' Drop, which
+    // is what actually closes the descriptor — there is no explicit close to call.
+    fn shutdown(self: &mut Self): void {
+        self.tls = Option.None
+        self.tcp = TcpStream {
+            fd: -1 as i32
+        }
+        self.buf = ""
+        self.pos = 0
+    }
+}
+
+// `tag | int32 length | payload` — the shape of every message after the startup
+// packet, in both directions.
+fn frame(tag: u8, payload: &string): string {
+    var out: string = ""
+    out.push(tag)
+    Bytes.writeI32Be(out, (payload.len + 4) as i32)
+    out.pushStr(payload)
+    return out
+}
+
+fn pushCString(out: &mut string, s: &string): void {
+    out.pushStr(s)
+    out.push(0 as u8)
+}
+
+// Read a NUL-terminated string starting at `off`.
+fn readCString(src: &string, off: i64): string {
+    var out: string = ""
+    var i = off
+    while i < src.len && src[i] != 0 as u8 {
+        out.push(src[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── Authentication ───────────────────────────────────────────────────────────
+
+// SCRAM nonces are printable ASCII with the comma excluded (it separates fields).
+// This alphabet is a conservative subset of that.
+let NONCE_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// A fresh client nonce per connection, from the OS entropy source. The probe in
+// docs/ used a fixed one so the exchange was reproducible while debugging; a fixed
+// nonce in a real client throws away the whole point of the challenge, because a
+// recorded exchange could then be replayed.
+fn makeNonce(): string {
+    var out: string = ""
+    for _ in 0..24 {
+        out.push(NONCE_ALPHABET[Random.int(NONCE_ALPHABET.len)])
+    }
+    return out
+}
+
+// Pull `key=value` out of a comma-separated SCRAM message.
+fn scramField(msg: &string, key: u8): string {
+    var i: i64 = 0
+    while i < msg.len {
+        if msg[i] == key && i + 1 < msg.len && msg[i + 1] == '=' {
+            var v: string = ""
+            var j: i64 = i + 2
+            while j < msg.len && msg[j] != ',' {
+                v.push(msg[j])
+                j = j + 1
+            }
+            return v
+        }
+        while i < msg.len && msg[i] != ',' {
+            i = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn xorBytes(a: &string, b: &string): string {
+    var out: string = ""
+    for i in 0..a.len {
+        out.push(a[i] ^ b[i])
+    }
+    return out
+}
+
+// Names for the authentication requests this client does NOT implement, so an
+// unsupported server configuration says which one it wanted instead of failing
+// with a generic error or, worse, silently continuing.
+fn authMethodName(code: i64): string {
+    if code == 2 {
+        return "Kerberos V5"
+    }
+    if code == 6 {
+        return "SCM credential"
+    }
+    if code == 7 {
+        return "GSSAPI"
+    }
+    if code == 8 {
+        return "GSSAPI continue"
+    }
+    if code == 9 {
+        return "SSPI"
+    }
+    return "unknown (AuthenticationRequest code " + code.toString() + ")"
+}
+
+fn md5Response(user: &string, password: &string, salt: &string): string {
+    // md5(md5(password + user) + salt), hex, prefixed with the literal "md5".
+    let inner = Crypto.md5(password + user)
+    return "md5" + Crypto.md5(inner + salt)
+}
+
+// The full SCRAM-SHA-256 exchange, lifted from docs/scram-probe.milo with the two
+// things the probe faked made real (random nonce, password from config) and the
+// step it skipped added: verifying the server's ServerSignature.
+fn scramAuth(st: &mut PgStream, cfg: &Dsn, saslBody: &string): Result<Unit, PgError> {
+    var mechs: Vec<string> = Vec.new()
+    var i: i64 = 4
+    while i < saslBody.len && saslBody[i] != 0 as u8 {
+        let name = readCString(saslBody, i)
+        i = i + name.len + 1
+        mechs.push(name)
+    }
+    var offered: string = ""
+    var supported: bool = false
+    for m in mechs {
+        if offered.len > 0 {
+            offered.pushStr(", ")
+        }
+        offered.pushStr(m)
+        if m == "SCRAM-SHA-256" {
+            supported = true
+        }
+    }
+    if !supported {
+        // SCRAM-SHA-256-PLUS needs TLS channel binding, which this client does not
+        // do; a server that offers only PLUS is a real configuration, so say so.
+        return Result.Err(PgError.client("no supported SASL mechanism (server offered: " + offered + "); this client implements SCRAM-SHA-256"))
+    }
+    if cfg.password.len == 0 {
+        return Result.Err(PgError.client("server requested SCRAM-SHA-256 but the DSN carries no password"))
+    }
+
+    let nonce = makeNonce()
+    let bare = "n=,r=" + nonce
+    var initial: string = ""
+    pushCString(initial, "SCRAM-SHA-256")
+    let gs2 = "n,,"
+    // "n,," = this client does not support channel binding. It is part of the
+    // AuthMessage the server hashes, so it cannot be adjusted independently.
+    Bytes.writeI32Be(initial, (gs2.len + bare.len) as i32)
+    initial.pushStr(gs2)
+    initial.pushStr(bare)
+    st.sendAll(frame('p', initial))?
+
+    let m1 = st.readMsg()?
+    if m1.tag == 'E' {
+        return Result.Err(decodeErrorFields(m1.body))
+    }
+    if m1.tag != 'R' || ((Bytes.readI32Be(m1.body, 0) ?? -1 as i32) as i64) != 11 {
+        return Result.Err(PgError.protocol("expected AuthenticationSASLContinue"))
+    }
+    let serverFirst = m1.body.substr(4, m1.body.len)
+
+    let combined = scramField(serverFirst, 'r')
+    let saltB64 = scramField(serverFirst, 's')
+    let iterText = scramField(serverFirst, 'i')
+    // The server nonce must be our nonce with its own appended. Skipping this is
+    // how a replayed server-first goes unnoticed.
+    if combined.len <= nonce.len || combined.substr(0, nonce.len) != nonce {
+        return Result.Err(PgError.protocol("server nonce does not extend the client nonce"))
+    }
+    let Option.Some(iters) = iterText.parseInt() else {
+        return Result.Err(PgError.protocol("bad SCRAM iteration count '" + iterText + "'"))
+    }
+    // A server picks the iteration count, so it can also pick one that pins a CPU
+    // for hours. 10M is ~2400x the PostgreSQL default and still finishes.
+    if iters <= 0 || iters > 10000000 {
+        return Result.Err(PgError.protocol("refusing SCRAM iteration count " + iters.toString()))
+    }
+    let Result.Ok(salt) = Base64.decode(saltB64) else {
+        return Result.Err(PgError.protocol("bad SCRAM salt encoding"))
+    }
+    let Result.Ok(salted) = Pbkdf2.sha256(cfg.password, salt, iters, 32) else {
+        return Result.Err(PgError.client("PBKDF2 failed"))
+    }
+
+    let clientKey = Hmac.sha256Bytes(salted, "Client Key")
+    let storedKey = Sha256.bytes(clientKey)
+    let finalNoProof = "c=biws,r=" + combined
+    let authMessage = bare + "," + serverFirst + "," + finalNoProof
+    let clientSig = Hmac.sha256Bytes(storedKey, authMessage)
+    let clientFinal = finalNoProof + ",p=" + Base64.encode(xorBytes(clientKey, clientSig))
+    st.sendAll(frame('p', clientFinal))?
+
+    let m2 = st.readMsg()?
+    if m2.tag == 'E' {
+        return Result.Err(decodeErrorFields(m2.body))
+    }
+    if m2.tag != 'R' || ((Bytes.readI32Be(m2.body, 0) ?? -1 as i32) as i64) != 12 {
+        return Result.Err(PgError.protocol("expected AuthenticationSASLFinal"))
+    }
+    let serverFinal = m2.body.substr(4, m2.body.len)
+    let serverErr = scramField(serverFinal, 'e')
+    if serverErr.len > 0 {
+        return Result.Err(PgError.client("SCRAM authentication failed: " + serverErr))
+    }
+
+    // The half the probe skipped. ServerSignature proves the peer holds the stored
+    // key — i.e. that it is the real server and not something that just says "ok".
+    // Without this check an impostor could answer AuthenticationOk and read every
+    // query we then send.
+    let serverKey = Hmac.sha256Bytes(salted, "Server Key")
+    let serverSig = Hmac.sha256Bytes(serverKey, authMessage)
+    if !constantTimeEq(Base64.encode(serverSig), scramField(serverFinal, 'v')) {
+        return Result.Err(PgError.client("server signature mismatch: the server did not prove knowledge of the stored key"))
+    }
+    return Result.Ok(Unit {
+    }
+    )
+}
+
+// Drive the authentication handshake to AuthenticationOk.
+fn authenticate(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
+    while true {
+        let m = st.readMsg()?
+        if m.tag == 'E' {
+            return Result.Err(decodeErrorFields(m.body))
+        }
+        if m.tag == 'N' {
+            continue
+        }
+        if m.tag != 'R' {
+            return Result.Err(PgError.protocol("expected an authentication message, got tag '" + tagName(m.tag) + "'"))
+        }
+        let code = ((Bytes.readI32Be(m.body, 0) ?? -1 as i32) as i64)
+        if code == 0 {
+            // Either the server wanted nothing (trust) or the method just finished.
+            return Result.Ok(Unit {
+            }
+            )
+        }
+        if code == 3 {
+            if cfg.password.len == 0 {
+                return Result.Err(PgError.client("server requested a cleartext password but the DSN carries none"))
+            }
+            var p: string = ""
+            pushCString(p, cfg.password)
+            st.sendAll(frame('p', p))?
+        } else if code == 5 {
+            if cfg.password.len == 0 {
+                return Result.Err(PgError.client("server requested an MD5 password but the DSN carries none"))
+            }
+            if m.body.len < 8 {
+                return Result.Err(PgError.protocol("AuthenticationMD5Password without a 4-byte salt"))
+            }
+            var p: string = ""
+            pushCString(p, md5Response(cfg.user, cfg.password, m.body.substr(4, 8)))
+            st.sendAll(frame('p', p))?
+        } else if code == 10 {
+            scramAuth(st, cfg, m.body)?
+        } else {
+            return Result.Err(PgError.client("unsupported authentication method: " + authMethodName(code) + " — this client implements SCRAM-SHA-256, MD5, cleartext and trust"))
+        }
+    }
+    return Result.Ok(Unit {
+    }
+    )
+}
+
+fn tagName(t: u8): string {
+    var s: string = ""
+    s.push(t)
+    return s
+}
+
+// ── Connection ───────────────────────────────────────────────────────────────
+
+// Transaction status as reported by every ReadyForQuery.
+pub let TX_IDLE: u8 = 'I'
+
+pub let TX_ACTIVE: u8 = 'T'
+
+pub let TX_FAILED: u8 = 'E'
+
+// An open session with a backend.
+//
+// Not thread-safe and not pooled: one Conn is one socket carrying one
+// request/response conversation at a time. Pooling is out of scope for v0.1.
+pub struct Conn {
+    stream: PgStream,
+    params: HashMap<string, string>,
+    notices: Vec<PgError>,
+    status: u8,
+    backendPid: i32,
+    backendKey: i32,
+    open: bool,
+}
+
+impl Conn {
+    // Connect and authenticate. `dsn` is a URL:
+    //
+    //   postgres://user:password@host:5432/database?sslmode=require
+    //
+    // Returns once the server has answered ReadyForQuery, so a successful result
+    // means the session is usable, not merely that the socket opened.
+    fn connect(dsn: &string): Result<Conn, PgError> {
+        let cfg = parseDsn(dsn)?
+        return Conn.connectWith(cfg)
+    }
+
+    // connect() with an already-parsed DSN, for a caller that builds one itself.
+    fn connectWith(cfg: &Dsn): Result<Conn, PgError> {
+        let Result.Ok(ip) = resolve(cfg.host) else {
+            return Result.Err(PgError.client("could not resolve host '" + cfg.host + "'"))
+        }
+        let Result.Ok(tcp) = TcpStream.connect(ip, cfg.port) else {
+            return Result.Err(PgError.client("could not connect to " + cfg.host + ":" + cfg.port.toString()))
+        }
+        var st = PgStream.wrap(tcp)
+        if cfg.sslmode != "disable" {
+            match negotiateTls(st, cfg) {
+                Result.Ok(_) => {
+                }
+                Result.Err(e) => {
+                    // libpq's rule for `prefer`/`allow`: if TLS cannot be
+                    // established, fall back to plaintext. It has to be a fresh
+                    // connection — this socket's fd was handed to the TLS layer
+                    // and closed with it, and the server has already read an
+                    // SSLRequest on it either way.
+                    if cfg.sslmode == "prefer" || cfg.sslmode == "allow" {
+                        let plain = Dsn {
+                            host: cfg.host.clone(), port: cfg.port, user: cfg.user.clone(),
+                            password: cfg.password.clone(), database: cfg.database.clone(),
+                            sslmode: "disable", sslrootcert: "", appName: cfg.appName.clone()
+                        }
+                        return Conn.connectWith(plain)
+                    }
+                    return Result.Err(e)
+                }
+            }
+        }
+
+        var body: string = ""
+        // Protocol version 3.0, as major<<16 | minor.
+        Bytes.writeI32Be(body, 196608 as i32)
+        pushCString(body, "user")
+        pushCString(body, cfg.user)
+        pushCString(body, "database")
+        pushCString(body, cfg.database)
+        pushCString(body, "application_name")
+        pushCString(body, cfg.appName)
+        pushCString(body, "client_encoding")
+        pushCString(body, "UTF8")
+        // The parameter LIST needs its own terminator after the last pair. Without
+        // it the server answers ErrorResponse with no hint that this is the cause
+        // — see docs/wire-notes.md.
+        body.push(0 as u8)
+        var pkt: string = ""
+        Bytes.writeI32Be(pkt, (body.len + 4) as i32)
+        pkt.pushStr(body)
+        // The startup packet has no tag byte; every later message does.
+        st.sendAll(pkt)?
+        authenticate(st, cfg)?
+
+        var c = Conn {
+            stream: st, params: HashMap.new(), notices: Vec.new(),
+            status: TX_IDLE, backendPid: 0 as i32, backendKey: 0 as i32, open: true
+        }
+        c.awaitReady()?
+        return Result.Ok(c)
+    }
+
+    // Run one or more statements through the simple query protocol.
+    //
+    // Values are interpolated by YOU into `sql`, so this is the wrong entry point
+    // for anything containing user input — use queryParams.
+    fn query(self: &mut Self, sql: &string): Result<Rows, PgError> {
+        self.requireOpen()?
+        var body: string = ""
+        pushCString(body, sql)
+        self.stream.sendAll(frame('Q', body))?
+        return self.collect()
+    }
+
+    // Run one statement with real bind parameters, over the extended query
+    // protocol (Parse / Bind / Describe / Execute / Sync).
+    //
+    // THIS IS THE INJECTION-SAFE ENTRY POINT, and the reason it exists. Parameters
+    // travel in the Bind message as length-prefixed values, in their own protocol
+    // fields — the server never re-parses them as SQL, so `'; drop table users --`
+    // is a seven-word string and not a statement. Building the same query by
+    // concatenating that text into `sql` and calling `query` is the injection hole
+    // this closes; do not do it.
+    //
+    // Placeholders are PostgreSQL's positional `$1`, `$2`, … matching the order of
+    // `params`. Parameter types are left unspecified (zero type OIDs), so the
+    // server infers each one from where it is used.
+    fn queryParams(self: &mut Self, sql: &string, params: &Vec<PgValue>): Result<Rows, PgError> {
+        self.requireOpen()?
+        var out: string = ""
+
+        // Parse — unnamed statement, no declared parameter types.
+        var p: string = ""
+        p.push(0 as u8)
+        pushCString(p, sql)
+        Bytes.writeI16Be(p, 0 as i16)
+        out.pushStr(frame('P', p))
+
+        // Bind — unnamed portal from the unnamed statement.
+        var b: string = ""
+        b.push(0 as u8)
+        b.push(0 as u8)
+        // Zero parameter format codes = every parameter is text. Same below for
+        // results: text format for v0.1 (see the file header).
+        Bytes.writeI16Be(b, 0 as i16)
+        // The count field is 16 bits and `as i16` would wrap silently past 32767,
+        // producing a Bind the server reads as a different query. PostgreSQL's own
+        // limit is 65535, so refuse above that rather than truncate.
+        if params.len() > 65535 {
+            return Result.Err(PgError.client("too many bind parameters: " + params.len().toString() + " (PostgreSQL allows 65535)"))
+        }
+        Bytes.writeU16Be(b, params.len() as u16)
+        for v in params {
+            if v.isNull() {
+                // -1 length is NULL. An empty value is length 0 — the two are
+                // different on the wire, which is what keeps them different in a
+                // result set.
+                Bytes.writeI32Be(b, -1 as i32)
+            } else {
+                let text = v.toWire()
+                Bytes.writeI32Be(b, text.len as i32)
+                b.pushStr(text)
+            }
+        }
+        Bytes.writeI16Be(b, 0 as i16)
+        out.pushStr(frame('B', b))
+
+        // Describe the portal, so a RowDescription comes back and results decode.
+        var d: string = ""
+        d.push('P')
+        d.push(0 as u8)
+        out.pushStr(frame('D', d))
+
+        // Execute with no row limit, then Sync to close the transaction block and
+        // get ReadyForQuery.
+        var e: string = ""
+        e.push(0 as u8)
+        Bytes.writeI32Be(e, 0 as i32)
+        out.pushStr(frame('E', e))
+        out.pushStr(frame('S', ""))
+
+        self.stream.sendAll(out)?
+        return self.collect()
+    }
+
+    // Run a statement for its effect. Returns the number of rows it affected, as
+    // reported by CommandComplete (0 for a statement that reports none).
+    fn exec(self: &mut Self, sql: &string): Result<i64, PgError> {
+        let rows = self.query(sql)?
+        return Result.Ok(rows.affectedRows())
+    }
+
+    // exec() with bind parameters — the injection-safe form, same rules as
+    // queryParams.
+    fn execParams(self: &mut Self, sql: &string, params: &Vec<PgValue>): Result<i64, PgError> {
+        let rows = self.queryParams(sql, params)?
+        return Result.Ok(rows.affectedRows())
+    }
+
+    fn begin(self: &mut Self): Result<Unit, PgError> {
+        let _ = self.exec("BEGIN")?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    fn commit(self: &mut Self): Result<Unit, PgError> {
+        let _ = self.exec("COMMIT")?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    fn rollback(self: &mut Self): Result<Unit, PgError> {
+        let _ = self.exec("ROLLBACK")?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Send Terminate and close the socket. Idempotent; using the Conn afterwards
+    // is an error rather than a silent reconnect.
+    fn close(self: &mut Self): void {
+        if self.open {
+            // Best effort: if the peer is already gone there is nothing to report
+            // and nothing a caller could do about it.
+            let _ = self.stream.sendAll(frame('X', ""))
+            self.open = false
+        }
+        self.stream.shutdown()
+    }
+
+    fn isOpen(self: &Self): bool {
+        return self.open
+    }
+
+    // 'I' idle, 'T' inside a transaction, 'E' inside a FAILED transaction where
+    // every statement is rejected until ROLLBACK. The last one is the reason this
+    // is exposed: without it a failed transaction looks like a run of unrelated
+    // errors.
+    fn txStatus(self: &Self): u8 {
+        return self.status
+    }
+
+    fn inTransaction(self: &Self): bool {
+        return self.status == TX_ACTIVE || self.status == TX_FAILED
+    }
+
+    fn txFailed(self: &Self): bool {
+        return self.status == TX_FAILED
+    }
+
+    fn txStatusName(self: &Self): string {
+        if self.status == TX_ACTIVE {
+            return "in transaction"
+        }
+        if self.status == TX_FAILED {
+            return "failed transaction"
+        }
+        return "idle"
+    }
+
+    // A ParameterStatus the server reported, e.g. "server_version", "TimeZone".
+    fn parameter(self: &Self, name: &string): Option<string> {
+        return self.params.get(name)
+    }
+
+    fn backendProcessId(self: &Self): i32 {
+        return self.backendPid
+    }
+
+    // NoticeResponses received so far, decoded the same way errors are. They are
+    // collected rather than printed: a library that writes to stdout on its own
+    // is a library you cannot embed.
+    fn notices(self: &Self): Vec<PgError> {
+        return self.notices.clone()
+    }
+
+    fn clearNotices(self: &mut Self): void {
+        self.notices = Vec.new()
+    }
+
+    fn requireOpen(self: &Self): Result<Unit, PgError> {
+        if !self.open {
+            return Result.Err(PgError.client("connection is closed"))
+        }
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Consume startup chatter (ParameterStatus, BackendKeyData) up to the first
+    // ReadyForQuery.
+    fn awaitReady(self: &mut Self): Result<Unit, PgError> {
+        let _ = self.collect()?
+        return Result.Ok(Unit {
+        }
+        )
+    }
+
+    // Read messages until ReadyForQuery, building the result set.
+    //
+    // An ErrorResponse does NOT return early: the server still owes us a
+    // ReadyForQuery, and leaving it in the socket desynchronises every later
+    // query. So the error is held and returned once the exchange is complete.
+    fn collect(self: &mut Self): Result<Rows, PgError> {
+        var rows = Rows.empty()
+        var err = PgError.empty()
+        var failed: bool = false
+        while true {
+            let m = self.stream.readMsg()?
+            let t = m.tag
+            if t == 'Z' {
+                if m.body.len > 0 {
+                    self.status = m.body[0]
+                }
+                break
+            } else if t == 'T' {
+                rows.setDescription(m.body)
+            } else if t == 'D' {
+                rows.addRow(m.body)
+            } else if t == 'C' {
+                let tag = readCString(m.body, 0)
+                rows.affected = rows.affected + affectedFromTag(tag)
+                rows.commands.push(tag)
+            } else if t == 'I' {
+                // EmptyQueryResponse — an empty statement string. Recorded so a
+                // caller can tell it apart from a statement that returned nothing.
+                rows.commands.push("EMPTY")
+            } else if t == 'E' {
+                err = decodeErrorFields(m.body)
+                failed = true
+            } else if t == 'N' {
+                self.notices.push(decodeErrorFields(m.body))
+            } else if t == 'S' {
+                let name = readCString(m.body, 0)
+                let value = readCString(m.body, name.len + 1)
+                self.params.insert(name, value)
+            } else if t == 'K' {
+                self.backendPid = Bytes.readI32Be(m.body, 0) ?? 0 as i32
+                self.backendKey = Bytes.readI32Be(m.body, 4) ?? 0 as i32
+            } else if t == 'A' {
+                // NotificationResponse. LISTEN/NOTIFY is out of scope for v0.1, but
+                // the message must still be drained: a client that chokes on an
+                // unexpected tag would wedge the moment anything else NOTIFYs.
+                continue
+            } else if t == '1' || t == '2' || t == '3' || t == 'n' || t == 't' || t == 's' {
+                // ParseComplete, BindComplete, CloseComplete, NoData,
+                // ParameterDescription, PortalSuspended — extended-protocol
+                // acknowledgements with nothing to collect.
+                continue
+            } else if t == 'G' {
+                // CopyInResponse. COPY is out of scope, but the server is now
+                // waiting for copy data; CopyFail is what unwedges it, and without
+                // that the connection hangs rather than erroring.
+                var reason: string = ""
+                pushCString(reason, "COPY is not supported by milo-postgres")
+                let _ = self.stream.sendAll(frame('f', reason))
+                err = PgError.client("COPY is not supported in v0.1")
+                failed = true
+            } else if t == 'H' || t == 'd' || t == 'c' || t == 'W' {
+                // CopyOutResponse / CopyData / CopyDone / CopyBothResponse — drained
+                // for the same reason.
+                continue
+            } else {
+                err = PgError.protocol("unexpected message tag '" + tagName(t) + "'")
+                failed = true
+            }
+        }
+        if failed {
+            return Result.Err(err)
+        }
+        return Result.Ok(rows)
+    }
+}
+
+// "INSERT 0 5", "UPDATE 3", "DELETE 2", "SELECT 7" — the count is the last field.
+fn affectedFromTag(tag: &string): i64 {
+    var last: string = ""
+    for part in tag.split(" ") {
+        if part.len > 0 {
+            last = part.clone()
+        }
+    }
+    return last.parseInt() ?? 0
+}
+
+// Ask for TLS before the startup packet, and upgrade the socket in place.
+//
+// PostgreSQL's own `sslmode=require` encrypts WITHOUT verifying the certificate.
+// This client cannot do that: std/fetch's TlsStream always verifies against the
+// system trust store, so `require` here behaves like libpq's `verify-full`. That
+// is the safer direction to differ in, and `sslrootcert=<path>` is how a private
+// CA (the usual reason people reach for unverified TLS) is trusted instead.
+fn negotiateTls(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
+    var req: string = ""
+    Bytes.writeI32Be(req, 8 as i32)
+    // 1234 << 16 | 5679, the SSLRequest code. It occupies the version field, which
+    // is why this has to go out before the startup packet and not after.
+    Bytes.writeI32Be(req, 80877103 as i32)
+    st.sendAll(req)?
+    if !st.ensure(1) {
+        return Result.Err(PgError.client("connection closed during SSL negotiation"))
+    }
+    let reply = st.buf[st.pos]
+    st.pos = st.pos + 1
+    st.compact()
+    if reply == 'N' {
+        if cfg.sslmode == "prefer" || cfg.sslmode == "allow" {
+            return Result.Ok(Unit {
+            }
+            )
+        }
+        return Result.Err(PgError.client("server does not support SSL (sslmode=" + cfg.sslmode + ")"))
+    }
+    if reply != 'S' {
+        return Result.Err(PgError.protocol("unexpected reply '" + tagName(reply) + "' to SSLRequest"))
+    }
+    // Anything after that single byte would be plaintext the server sent before
+    // the handshake — i.e. injected. Refuse rather than feed it to the TLS layer.
+    if st.buf.len > st.pos {
+        return Result.Err(PgError.protocol("server sent data after accepting SSLRequest but before the handshake"))
+    }
+    st.buf = ""
+    st.pos = 0
+    // take() hands the descriptor to the TlsStream and leaves the TcpStream at -1,
+    // so exactly one of them closes it.
+    let fd = st.tcp.take()
+    let Result.Ok(tls) = TlsStream.fromFd(fd, cfg.host, cfg.sslrootcert) else {
+        return Result.Err(PgError.client("TLS handshake with " + cfg.host + " failed (certificate not trusted, or hostname mismatch — set sslrootcert= for a private CA)"))
+    }
+    st.tls = Option.Some(tls)
+    return Result.Ok(Unit {
+    }
+    )
+}

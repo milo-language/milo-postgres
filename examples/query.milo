@@ -1,0 +1,123 @@
+// A tour of the client against a real server: connect, create, insert with bind
+// parameters, read back typed rows, provoke an error, and use a transaction.
+//
+//   sh scripts/test-server.sh start
+//   milo run examples/query.milo
+//   milo run examples/query.milo "postgres://user:pw@host:5432/db"   # or your own
+from "../lib" import {
+    Conn, PgValue, PgError
+}
+from "std/args" import {
+    args
+}
+from "std/env" import {
+    Env
+}
+
+fn main(): i32 {
+    let argv = args()
+    var dsn = Env.getOr("MILO_PG_DSN", "postgres://postgres:testpw@127.0.0.1:55432/milo_test")
+    if argv.len() > 1 {
+        dsn = argv[1].clone()
+    }
+
+    var db = match Conn.connect(dsn) {
+        Result.Ok(c) => c
+        Result.Err(e) => {
+            print("could not connect: " + e.toString())
+            print("hint: start the test server with `sh scripts/test-server.sh start`")
+            return 1
+        }
+    }
+    print("connected to PostgreSQL " + (db.parameter("server_version") ?? "?") + " as backend " + db.backendProcessId().toString())
+
+    let _ = db.exec("drop table if exists milo_example")!
+    let _ = db.exec("create table milo_example (
+        id       serial primary key,
+        name     text not null,
+        score    double precision,
+        active   boolean not null default true,
+        tags     jsonb,
+        added    date not null default current_date
+    )")!
+
+    // Every value goes through a bind parameter. Note the second name: it is a
+    // SQL fragment as far as the eye is concerned, and a plain string as far as
+    // the server is concerned.
+    var people: Vec<string> = Vec.new()
+    people.push("ada")
+    people.push("'); drop table milo_example; --")
+    people.push("grace")
+    var scores: Vec<f64> = Vec.new()
+    scores.push(99.5)
+    scores.push(0.0)
+    scores.push(88.25)
+    for i in 0..people.len() {
+        var p: Vec<PgValue> = Vec.new()
+        p.push(PgValue.Text(people[i].clone()))
+        p.push(PgValue.Float(scores[i]))
+        p.push(PgValue.Bool(i != 1))
+        p.push(PgValue.Text("{\"seq\": " + i.toString() + "}"))
+        let n = db.execParams("insert into milo_example (name, score, active, tags) values ($1, $2, $3, $4)", p)!
+        print("inserted " + n.toString() + " row")
+    }
+
+    // A NULL score, to show it stays distinct from 0.0.
+    var nullish: Vec<PgValue> = Vec.new()
+    nullish.push(PgValue.Text("unscored"))
+    nullish.push(PgValue.Null)
+    let _ = db.execParams("insert into milo_example (name, score) values ($1, $2)", nullish)!
+
+    print("")
+    let rows = db.query("select id, name, score, active, tags, added from milo_example order by id")!
+    print(rows.columns().join(" | "))
+    for row in rows.all() {
+        var line: string = ""
+        for c in 0..row.len() {
+            if c > 0 {
+                line.pushStr(" | ")
+            }
+            // isNull is checked first: printing NULL as "" would erase the
+            // difference between "no score" and "a score of zero".
+            line.pushStr(if row.isNullAt(c) {
+                "NULL"
+            } else {
+                row.valueAt(c).toString()
+            }
+            )
+        }
+        print(line)
+    }
+    print(rows.len().toString() + " rows, tag " + rows.commandTags() [0])
+
+    // Reading one typed column by name.
+    print("")
+    var best: f64 = 0.0
+    for row in rows.all() {
+        let s = row.f64("score") ?? 0.0
+        if s > best {
+            best = s
+        }
+    }
+    print("top score: " + best.toString())
+
+    // Errors carry the SQLSTATE, which is what a program should branch on.
+    match db.query("select * from a_table_nobody_made") {
+        Result.Ok(_) => {
+        }
+        Result.Err(e) => {
+            print("expected failure -> sqlstate " + e.code + ": " + e.message)
+        }
+    }
+
+    // A transaction, rolled back — the delete does not survive it.
+    db.begin()!
+    let deleted = db.exec("delete from milo_example")!
+    print("deleted " + deleted.toString() + " rows inside the transaction (status: " + db.txStatusName() + ")")
+    db.rollback()!
+    let after = db.query("select count(*) as n from milo_example")!
+    print("after rollback: " + (after.i64(0, "n") ?? -1).toString() + " rows still there")
+
+    db.close()
+    return 0
+}

@@ -1,0 +1,89 @@
+// TLS tests. Split out from postgres_test.milo because they need a server with a
+// certificate, which `scripts/test-server.sh` sets up and a stock PostgreSQL
+// service container does not — CI runs the other file against a container and
+// this one is driven by `scripts/run-tests.sh` locally. Keeping them separate is
+// deliberate: a TLS test that quietly skips when there is no certificate is worse
+// than no TLS test, because it reports success either way.
+from "../lib" import {
+    Conn, parseDsn
+}
+from "std/env" import {
+    Env
+}
+from "std/testing" import {
+    assertTrue, assertStrEqual, assertContains, assertMsg
+}
+
+fn dsn(): string {
+    return Env.getOr("MILO_PG_DSN", "postgres://postgres:testpw@127.0.0.1:55432/milo_test")
+}
+
+fn rootCert(): string {
+    return Env.getOr("MILO_PG_SSLROOTCERT", "/tmp/milo-pg-test/server.crt")
+}
+
+// The harness certificate names `localhost`, and the client always verifies the
+// hostname, so the TLS tests connect by that name.
+fn tlsDsn(query: &string): string {
+    let d = parseDsn(dsn())!
+    return "postgres://" + d.user + ":" + d.password + "@localhost:" + d.port.toString() + "/" + d.database + query
+}
+
+// The whole SSLRequest → upgrade → SCRAM-over-TLS path, confirmed by the server's
+// own view of the connection rather than by our belief about it.
+fn testTlsUpgrade(): void {
+    var c = match Conn.connect(tlsDsn("?sslmode=require&sslrootcert=" + rootCert())) {
+        Result.Ok(v) => v
+        Result.Err(e) => {
+            assertMsg(false, "TLS connect failed: " + e.toString())
+            return
+        }
+    }
+    let r = c.query("select ssl, version from pg_stat_ssl where pid = pg_backend_pid()")!
+    assertStrEqual(r.str(0, "ssl") ?? "", "true")
+    assertContains(r.str(0, "version") ?? "", "TLSv1.")
+    // And the session works normally on top of it.
+    let q = c.query("select 42 as n")!
+    assertTrue((q.i64(0, "n") ?? -1) == 42)
+    c.close()
+}
+
+// std/fetch's TlsStream always verifies against the system trust store, so a
+// self-signed server certificate must be refused unless it is named explicitly.
+// This is the check that separates "encrypted" from "encrypted to the right peer".
+fn testUntrustedCertificateIsRefused(): void {
+    match Conn.connect(tlsDsn("?sslmode=require")) {
+        Result.Ok(_) => {
+            assertMsg(false, "an untrusted self-signed certificate was accepted")
+        }
+        Result.Err(e) => {
+            assertContains(e.message, "TLS handshake")
+        }
+    }
+}
+
+// TLS is opt-in. The default DSN must produce a plaintext session even against a
+// server that offers SSL — otherwise "defaults off" is only a claim.
+fn testDefaultConnectionIsPlaintext(): void {
+    var c = Conn.connect(tlsDsn(""))!
+    let r = c.query("select ssl from pg_stat_ssl where pid = pg_backend_pid()")!
+    assertStrEqual(r.str(0, "ssl") ?? "", "false")
+    c.close()
+}
+
+// `prefer` takes TLS when it can be verified and silently falls back otherwise —
+// here it cannot verify the self-signed certificate, so the session must still
+// come up, in plaintext.
+fn testPreferFallsBackToPlaintext(): void {
+    var c = Conn.connect(tlsDsn("?sslmode=prefer"))!
+    let r = c.query("select ssl from pg_stat_ssl where pid = pg_backend_pid()")!
+    assertStrEqual(r.str(0, "ssl") ?? "", "false")
+    c.close()
+}
+
+fn testPreferUsesTlsWhenItVerifies(): void {
+    var c = Conn.connect(tlsDsn("?sslmode=prefer&sslrootcert=" + rootCert()))!
+    let r = c.query("select ssl from pg_stat_ssl where pid = pg_backend_pid()")!
+    assertStrEqual(r.str(0, "ssl") ?? "", "true")
+    c.close()
+}

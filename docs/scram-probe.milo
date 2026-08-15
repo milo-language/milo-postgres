@@ -3,12 +3,24 @@
 // (pbkdf2, hmac, sha256, base64) already exists in std, but they have to compose
 // byte-exactly or the server just says "password authentication failed" with no
 // clue which step drifted.
-from "std/net" import { TcpStream, ip4 }
-from "std/binary" import { Bytes }
-from "std/hmac" import { Hmac }
-from "std/sha256" import { Sha256 }
-from "std/pbkdf2" import { Pbkdf2 }
-from "std/base64" import { Base64 }
+from "std/net" import {
+    TcpStream, ip4
+}
+from "std/binary" import {
+    Bytes
+}
+from "std/hmac" import {
+    Hmac
+}
+from "std/sha256" import {
+    Sha256
+}
+from "std/pbkdf2" import {
+    Pbkdf2
+}
+from "std/base64" import {
+    Base64
+}
 
 fn xorBytes(a: &string, b: &string): string {
     var out: string = ""

@@ -1,0 +1,511 @@
+// Integration tests for the PostgreSQL client. They need a real server: start one
+// with `sh scripts/test-server.sh start`, or run the whole gate with
+// `sh scripts/run-tests.sh`.
+//
+// The server the harness builds requires scram-sha-256 over TCP on purpose. A
+// stock install trusts localhost, and under `trust` the authentication path never
+// executes — the suite would be green while the most delicate part of the client
+// went entirely unexercised.
+//
+// Each test opens its own connection (milo test runs every test in its own
+// process) and uses TEMP tables, so no two tests can collide on a name.
+from "../lib" import {
+    Conn, PgValue, PgError, Dsn, parseDsn, TX_IDLE, TX_ACTIVE, TX_FAILED
+}
+from "std/env" import {
+    Env
+}
+from "std/testing" import {
+    assertTrue, assertFalse, assertEqual64, assertStrEqual, assertContains, assertMsg
+}
+
+fn dsn(): string {
+    return Env.getOr("MILO_PG_DSN", "postgres://postgres:testpw@127.0.0.1:55432/milo_test")
+}
+
+// The harness DSN with a different role, so the md5/cleartext tests follow the
+// same host and port as everything else.
+fn dsnAs(user: &string, password: &string): string {
+    let d = parseDsn(dsn())!
+    return "postgres://" + user + ":" + password + "@" + d.host + ":" + d.port.toString() + "/" + d.database
+}
+
+fn openConn(): Conn {
+    match Conn.connect(dsn()) {
+        Result.Ok(c) => {
+            return c
+        }
+        Result.Err(e) => {
+            assertMsg(false, "connect failed: " + e.toString())
+            // Unreachable: assertMsg(false) traps. The return keeps the function
+            // total for the type checker.
+            return Conn.connect(dsn())!
+        }
+    }
+}
+
+// ── Authentication ───────────────────────────────────────────────────────────
+
+fn testConnectOverScram(): void {
+    var c = openConn()
+    assertTrue(c.isOpen())
+    // ParameterStatus was consumed and recorded rather than skipped.
+    assertTrue(c.parameter("server_version").isSome())
+    assertTrue(c.backendProcessId() != 0 as i32)
+    assertTrue(c.txStatus() == TX_IDLE)
+    c.close()
+    assertFalse(c.isOpen())
+}
+
+// The negative control. Without it, an authentication path that always "succeeds"
+// — one that ignored the server signature, or never sent a proof at all — would
+// pass every other test in this file.
+fn testWrongPasswordRejected(): void {
+    match Conn.connect("postgres://postgres:definitelynotthepassword@127.0.0.1:55432/milo_test") {
+        Result.Ok(_) => {
+            assertMsg(false, "a wrong password was accepted")
+        }
+        Result.Err(e) => {
+            // 28P01 = invalid_password. Matching the SQLSTATE rather than the
+            // message text is the point of decoding the error into fields.
+            assertStrEqual(e.code, "28P01")
+            assertStrEqual(e.severity, "FATAL")
+        }
+    }
+}
+
+// The md5 path, against a role whose pg_hba line demands `md5`. The server
+// verifies our digest, so a green result means md5(md5(password+user)+salt) was
+// computed correctly — not merely that we sent something.
+fn testMd5Auth(): void {
+    var c = match Conn.connect(dsnAs("md5user", "md5pw")) {
+        Result.Ok(v) => v
+        Result.Err(e) => {
+            assertMsg(false, "md5 auth failed: " + e.toString())
+            return
+        }
+    }
+    let r = c.query("select 1 as n")!
+    assertEqual64(r.i64(0, "n") ?? -1, 1)
+    c.close()
+}
+
+fn testMd5WrongPasswordRejected(): void {
+    match Conn.connect(dsnAs("md5user", "not-the-password")) {
+        Result.Ok(_) => {
+            assertMsg(false, "md5 accepted a wrong password")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "28P01")
+        }
+    }
+}
+
+// The cleartext path (`password` in pg_hba). Worth having even though nobody
+// should deploy it: it is one of the four methods the client claims to support.
+fn testCleartextAuth(): void {
+    var c = match Conn.connect(dsnAs("plainuser", "plainpw")) {
+        Result.Ok(v) => v
+        Result.Err(e) => {
+            assertMsg(false, "cleartext auth failed: " + e.toString())
+            return
+        }
+    }
+    let r = c.query("select 2 as n")!
+    assertEqual64(r.i64(0, "n") ?? -1, 2)
+    c.close()
+}
+
+fn testCleartextWrongPasswordRejected(): void {
+    match Conn.connect(dsnAs("plainuser", "not-the-password")) {
+        Result.Ok(_) => {
+            assertMsg(false, "cleartext accepted a wrong password")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "28P01")
+        }
+    }
+}
+
+// A password is required before the client will even try: failing here names the
+// missing password instead of letting the server answer "authentication failed",
+// which sends people looking in the wrong place.
+fn testMissingPasswordIsNamed(): void {
+    match Conn.connect(dsnAs("postgres", "")) {
+        Result.Ok(_) => {
+            assertMsg(false, "connected with no password")
+        }
+        Result.Err(e) => {
+            assertContains(e.message, "no password")
+        }
+    }
+}
+
+// ── Simple query and typed decode ────────────────────────────────────────────
+
+fn testSimpleQueryTypedRows(): void {
+    var c = openConn()
+    let r = c.query("select 1::int2 as a, 2::int4 as b, 3::int8 as c, 1.5::float4 as d, 2.5::float8 as e, true as f")!
+    assertEqual64(r.len(), 1)
+    assertEqual64(r.width(), 6)
+    assertEqual64(r.i64(0, "a") ?? -1, 1)
+    assertEqual64(r.i64(0, "b") ?? -1, 2)
+    assertEqual64(r.i64(0, "c") ?? -1, 3)
+    assertTrue((r.f64(0, "d") ?? 0.0) == 1.5)
+    assertTrue((r.f64(0, "e") ?? 0.0) == 2.5)
+    assertTrue(r.bool(0, "f") ?? false)
+    c.close()
+}
+
+// Every OID the README claims to decode, round-tripped through the server.
+fn testEveryDecodedOid(): void {
+    var c = openConn()
+    let r = c.query("select
+        'x'::text        as t_text,
+        'y'::varchar(8)  as t_varchar,
+        'z'::name        as t_name,
+        'w'::bpchar      as t_bpchar,
+        '\\x0102ff'::bytea as t_bytea,
+        '2026-08-15'::date as t_date,
+        '2026-08-15 10:11:12'::timestamp as t_ts,
+        '2026-08-15 10:11:12+00'::timestamptz as t_tstz,
+        '11111111-2222-3333-4444-555555555555'::uuid as t_uuid,
+        '{\"a\": 1}'::json  as t_json,
+        '{\"b\": 2}'::jsonb as t_jsonb,
+        12345678901234567890.0987654321::numeric as t_numeric")!
+    assertStrEqual(r.str(0, "t_text") ?? "", "x")
+    assertStrEqual(r.str(0, "t_varchar") ?? "", "y")
+    assertStrEqual(r.str(0, "t_name") ?? "", "z")
+    assertStrEqual(r.str(0, "t_bpchar") ?? "", "w")
+
+    // bytea comes back as raw bytes, not as the server's \x text.
+    let raw = r.bytes(0, "t_bytea") ?? ""
+    assertEqual64(raw.len, 3)
+    assertEqual64(raw[0] as i64, 1)
+    assertEqual64(raw[1] as i64, 2)
+    assertEqual64(raw[2] as i64, 255)
+
+    assertStrEqual(r.str(0, "t_date") ?? "", "2026-08-15")
+    assertStrEqual(r.str(0, "t_ts") ?? "", "2026-08-15 10:11:12")
+    assertContains(r.str(0, "t_tstz") ?? "", "2026-08-15")
+    assertStrEqual(r.str(0, "t_uuid") ?? "", "11111111-2222-3333-4444-555555555555")
+    assertContains(r.str(0, "t_json") ?? "", "\"a\"")
+    assertContains(r.str(0, "t_jsonb") ?? "", "\"b\"")
+    // numeric stays exact text — an f64 would have dropped digits here, which is
+    // the whole reason it is not decoded as a float.
+    assertStrEqual(r.str(0, "t_numeric") ?? "", "12345678901234567890.0987654321")
+    c.close()
+}
+
+// NULL is not the empty string, at any layer.
+fn testNullIsNotEmptyString(): void {
+    var c = openConn()
+    let r = c.query("select null::text as n, ''::text as e")!
+    assertTrue(r.isNull(0, "n"))
+    assertFalse(r.isNull(0, "e"))
+    assertTrue(r.str(0, "n").isNone())
+    assertStrEqual(r.str(0, "e") ?? "MISSING", "")
+    // The same distinction survives detaching a Row.
+    let row = r.at(0)
+    assertTrue(row.isNull("n"))
+    assertFalse(row.isNull("e"))
+    c.close()
+}
+
+fn testMultiRowZeroRowAndMultiStatement(): void {
+    var c = openConn()
+
+    let many = c.query("select g as n from generate_series(1, 5) g")!
+    assertEqual64(many.len(), 5)
+    assertEqual64(many.i64(0, "n") ?? -1, 1)
+    assertEqual64(many.i64(4, "n") ?? -1, 5)
+    var sum: i64 = 0
+    for row in many.all() {
+        sum = sum + (row.i64("n") ?? 0)
+    }
+    assertEqual64(sum, 15)
+
+    let none = c.query("select 1 as n where false")!
+    assertEqual64(none.len(), 0)
+    // A zero-row result still knows its shape.
+    assertEqual64(none.width(), 1)
+
+    // A batch runs every statement; Rows holds the last result set and the
+    // command tags record the rest.
+    let batch = c.query("select 1 as a; select 2 as b, 3 as c")!
+    assertEqual64(batch.commandTags().len(), 2)
+    assertEqual64(batch.width(), 2)
+    assertEqual64(batch.i64(0, "b") ?? -1, 2)
+    c.close()
+}
+
+// ── Bind parameters ──────────────────────────────────────────────────────────
+
+// The reason queryParams exists: a parameter that looks like SQL must arrive as
+// data. If it were interpolated, the table would be gone and the length would not
+// be 22.
+fn testParametersAreBoundNotInterpolated(): void {
+    var c = openConn()
+    let _ = c.exec("create temp table bind_probe (id int primary key, note text)")!
+    let _ = c.exec("insert into bind_probe values (1, 'intact')")!
+
+    let evil = "'; DROP TABLE bind_probe --"
+    var params: Vec<PgValue> = Vec.new()
+    params.push(PgValue.Text(evil.clone()))
+    let r = c.queryParams("select $1::text as echoed, length($1::text) as n", params)!
+    assertStrEqual(r.str(0, "echoed") ?? "", evil)
+    assertEqual64(r.i64(0, "n") ?? -1, 27)
+
+    // The table the payload tried to drop is still there with its row.
+    let still = c.query("select note from bind_probe where id = 1")!
+    assertEqual64(still.len(), 1)
+    assertStrEqual(still.str(0, "note") ?? "", "intact")
+    c.close()
+}
+
+fn testParameterTypesRoundTrip(): void {
+    var c = openConn()
+    let _ = c.exec("create temp table types_probe (i bigint, f double precision, t text, b boolean, y bytea)")!
+
+    var params: Vec<PgValue> = Vec.new()
+    params.push(PgValue.Int(-9007199254740993))
+    params.push(PgValue.Float(2.5))
+    params.push(PgValue.Text("hello, world"))
+    params.push(PgValue.Bool(true))
+    params.push(PgValue.Bytes("\x00\xff\x10"))
+    let n = c.execParams("insert into types_probe values ($1, $2, $3, $4, $5)", params)!
+    assertEqual64(n, 1)
+
+    let r = c.query("select i, f, t, b, y from types_probe")!
+    assertEqual64(r.i64(0, "i") ?? 0, -9007199254740993)
+    assertTrue((r.f64(0, "f") ?? 0.0) == 2.5)
+    assertStrEqual(r.str(0, "t") ?? "", "hello, world")
+    assertTrue(r.bool(0, "b") ?? false)
+    let y = r.bytes(0, "y") ?? ""
+    assertEqual64(y.len, 3)
+    assertEqual64(y[0] as i64, 0)
+    assertEqual64(y[1] as i64, 255)
+    assertEqual64(y[2] as i64, 16)
+    c.close()
+}
+
+// A NULL parameter is a -1 length on the wire, not the text "NULL".
+fn testNullParameter(): void {
+    var c = openConn()
+    let _ = c.exec("create temp table null_probe (v text)")!
+    var params: Vec<PgValue> = Vec.new()
+    params.push(PgValue.Null)
+    let _ = c.execParams("insert into null_probe values ($1)", params)!
+    let r = c.query("select v, v is null as isnull from null_probe")!
+    assertTrue(r.bool(0, "isnull") ?? false)
+    assertTrue(r.isNull(0, "v"))
+    c.close()
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+fn testUndefinedTableSqlstate(): void {
+    var c = openConn()
+    match c.query("select * from a_table_that_does_not_exist") {
+        Result.Ok(_) => {
+            assertMsg(false, "expected 42P01")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "42P01")
+            assertStrEqual(e.severity, "ERROR")
+            assertContains(e.message, "a_table_that_does_not_exist")
+        }
+    }
+    // The connection is still usable: the ErrorResponse was followed to
+    // ReadyForQuery instead of being returned early.
+    let r = c.query("select 7 as n")!
+    assertEqual64(r.i64(0, "n") ?? -1, 7)
+    assertTrue(c.txStatus() == TX_IDLE)
+    c.close()
+}
+
+fn testUniqueViolationSqlstate(): void {
+    var c = openConn()
+    let _ = c.exec("create temp table uniq_probe (id int primary key)")!
+    let _ = c.exec("insert into uniq_probe values (1)")!
+    match c.exec("insert into uniq_probe values (1)") {
+        Result.Ok(_) => {
+            assertMsg(false, "expected 23505")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "23505")
+            // The fields that make a postgres error actionable survive decoding.
+            assertStrEqual(e.table, "uniq_probe")
+            assertContains(e.detail, "already exists")
+            assertContains(e.constraint, "uniq_probe")
+        }
+    }
+    c.close()
+}
+
+fn testSyntaxErrorCarriesPosition(): void {
+    var c = openConn()
+    match c.query("select from where") {
+        Result.Ok(_) => {
+            assertMsg(false, "expected a syntax error")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "42601")
+            assertTrue(e.position > 0 as i32)
+        }
+    }
+    c.close()
+}
+
+// ── Transactions ─────────────────────────────────────────────────────────────
+
+fn testCommitIsObservable(): void {
+    var c = openConn()
+    let _ = c.exec("drop table if exists tx_commit_probe")!
+    let _ = c.exec("create table tx_commit_probe (n int)")!
+    c.begin()!
+    assertTrue(c.txStatus() == TX_ACTIVE)
+    let _ = c.exec("insert into tx_commit_probe values (1), (2)")!
+    c.commit()!
+    assertTrue(c.txStatus() == TX_IDLE)
+
+    // Read it back on a SECOND connection, so this proves the commit reached the
+    // server rather than the same session seeing its own uncommitted work.
+    var other = openConn()
+    let r = other.query("select count(*) as n from tx_commit_probe")!
+    assertEqual64(r.i64(0, "n") ?? -1, 2)
+    other.close()
+
+    let _ = c.exec("drop table tx_commit_probe")!
+    c.close()
+}
+
+fn testRollbackIsObservable(): void {
+    var c = openConn()
+    let _ = c.exec("drop table if exists tx_rollback_probe")!
+    let _ = c.exec("create table tx_rollback_probe (n int)")!
+    let _ = c.exec("insert into tx_rollback_probe values (1)")!
+    c.begin()!
+    let _ = c.exec("insert into tx_rollback_probe values (2), (3)")!
+    let inside = c.query("select count(*) as n from tx_rollback_probe")!
+    assertEqual64(inside.i64(0, "n") ?? -1, 3)
+    c.rollback()!
+    assertTrue(c.txStatus() == TX_IDLE)
+
+    var other = openConn()
+    let r = other.query("select count(*) as n from tx_rollback_probe")!
+    assertEqual64(r.i64(0, "n") ?? -1, 1)
+    other.close()
+
+    let _ = c.exec("drop table tx_rollback_probe")!
+    c.close()
+}
+
+// A failed transaction is a distinct state, not just a past error: every
+// statement is rejected until ROLLBACK. Tracking it is what makes that visible.
+fn testFailedTransactionIsVisible(): void {
+    var c = openConn()
+    c.begin()!
+    assertTrue(c.txStatus() == TX_ACTIVE)
+    match c.query("select * from nothing_here_at_all") {
+        Result.Ok(_) => {
+            assertMsg(false, "expected 42P01")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "42P01")
+        }
+    }
+    assertTrue(c.txFailed())
+    assertTrue(c.inTransaction())
+    assertStrEqual(c.txStatusName(), "failed transaction")
+    // 25P02: current transaction is aborted.
+    match c.query("select 1") {
+        Result.Ok(_) => {
+            assertMsg(false, "expected 25P02 inside a failed transaction")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "25P02")
+        }
+    }
+    c.rollback()!
+    assertTrue(c.txStatus() == TX_IDLE)
+    let r = c.query("select 1 as n")!
+    assertEqual64(r.i64(0, "n") ?? -1, 1)
+    c.close()
+}
+
+fn testExecReportsAffectedRows(): void {
+    var c = openConn()
+    let _ = c.exec("create temp table affected_probe (n int)")!
+    assertEqual64(c.exec("insert into affected_probe values (1), (2), (3)")!, 3)
+    assertEqual64(c.exec("update affected_probe set n = n + 1 where n > 1")!, 2)
+    assertEqual64(c.exec("delete from affected_probe where n = 4")!, 1)
+    c.close()
+}
+
+// ── Housekeeping the reader must not choke on ────────────────────────────────
+
+fn testNoticesAndParameterStatusAreConsumed(): void {
+    var c = openConn()
+    // RAISE NOTICE produces a NoticeResponse mid-exchange; SET produces a
+    // ParameterStatus. Both must be absorbed, and the query must still complete.
+    let _ = c.exec("do $$ begin raise notice 'hello from the server'; end $$")!
+    assertTrue(c.notices().len() >= 1)
+    let _ = c.exec("set application_name = 'milo-postgres-tests'")!
+    assertStrEqual(c.parameter("application_name") ?? "", "milo-postgres-tests")
+    let r = c.query("select 1 as n")!
+    assertEqual64(r.i64(0, "n") ?? -1, 1)
+    c.clearNotices()
+    assertEqual64(c.notices().len(), 0)
+    c.close()
+}
+
+fn testUseAfterCloseIsAnError(): void {
+    var c = openConn()
+    c.close()
+    match c.query("select 1") {
+        Result.Ok(_) => {
+            assertMsg(false, "a closed connection answered a query")
+        }
+        Result.Err(e) => {
+            assertStrEqual(e.code, "08000")
+        }
+    }
+}
+
+// ── DSN parsing (no server needed) ───────────────────────────────────────────
+
+fn testDsnDefaults(): void {
+    let d = parseDsn("postgres://alice@db.example.com/shop")!
+    assertStrEqual(d.host, "db.example.com")
+    assertEqual64(d.port as i64, 5432)
+    assertStrEqual(d.user, "alice")
+    assertStrEqual(d.database, "shop")
+    assertStrEqual(d.sslmode, "disable")
+
+    // libpq's rule: no database means the user's name.
+    let bare = parseDsn("postgresql://bob@localhost")!
+    assertStrEqual(bare.database, "bob")
+}
+
+fn testDsnPercentDecoding(): void {
+    // A password with '@' and '/' has to be percent-encoded; not decoding it is a
+    // silent authentication failure.
+    let d = parseDsn("postgres://u%40corp:p%40ss%2Fword@127.0.0.1:6000/db")!
+    assertStrEqual(d.user, "u@corp")
+    assertStrEqual(d.password, "p@ss/word")
+    assertEqual64(d.port as i64, 6000)
+}
+
+fn testDsnQueryParameters(): void {
+    let d = parseDsn("postgres://u:p@h/db?sslmode=require&application_name=svc&whatever=ignored")!
+    assertStrEqual(d.sslmode, "require")
+    assertStrEqual(d.appName, "svc")
+}
+
+fn testDsnRejectsBadInput(): void {
+    assertTrue(parseDsn("mysql://u@h/db").isErr())
+    assertTrue(parseDsn("just-a-string").isErr())
+    assertTrue(parseDsn("postgres://u@h:notaport/db").isErr())
+    assertTrue(parseDsn("postgres://u@h/db?sslmode=whoknows").isErr())
+}

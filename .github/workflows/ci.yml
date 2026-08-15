@@ -1,0 +1,103 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # A real PostgreSQL, not a mock. POSTGRES_HOST_AUTH_METHOD is the whole point
+    # of this block: the image defaults to `trust` for host connections, and under
+    # trust the client's authentication code never executes — CI would be green
+    # with SCRAM entirely unexercised.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: milo_test
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      MILO_PG_DSN: postgres://postgres:testpw@127.0.0.1:5432/milo_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1   # archive wraps the binary in milo-<platform>/
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      # The md5 and cleartext code paths need roles whose pg_hba line demands them;
+      # a single scram catch-all leaves both untested. pg_hba is first-match-wins,
+      # so the new lines go in front of it.
+      - name: Add roles for the md5 and cleartext auth paths
+        run: |
+          cid=$(docker ps --filter "ancestor=postgres:16" --format '{{.ID}}' | head -1)
+          docker exec "$cid" sh -c '
+            hba=/var/lib/postgresql/data/pg_hba.conf
+            { printf "host all md5user all md5\nhost all plainuser all password\n"; cat "$hba"; } > "$hba.new"
+            mv "$hba.new" "$hba"'
+          docker exec "$cid" su postgres -c "pg_ctl reload -D /var/lib/postgresql/data"
+          # password_encryption decides how the verifier is STORED, which is what
+          # the `md5` auth method needs; `password` auth works against either form.
+          PGPASSWORD=testpw psql -h 127.0.0.1 -U postgres -d milo_test -v ON_ERROR_STOP=1 \
+            -c "set password_encryption = 'md5'; create user md5user password 'md5pw';"
+          PGPASSWORD=testpw psql -h 127.0.0.1 -U postgres -d milo_test -v ON_ERROR_STOP=1 \
+            -c "set password_encryption = 'scram-sha-256'; create user plainuser password 'plainpw';"
+
+      - name: Tests
+        run: milo test tests/postgres_test.milo
+
+      - name: Example
+        run: milo run examples/query.milo
+
+      # psql is a second, independent implementation reading the rows the example
+      # just wrote. Without it the suite only proves the client agrees with itself.
+      - name: Cross-check the example's writes with psql
+        run: |
+          q() { PGPASSWORD=testpw psql -h 127.0.0.1 -U postgres -d milo_test -tAc "$1"; }
+          test "$(q 'select count(*) from milo_example')" = "4"
+          test "$(q 'select name from milo_example where id = 2')" = "'); drop table milo_example; --"
+          test "$(q 'select count(*) from milo_example where score is null')" = "1"
+
+  # tests/tls_test.milo is NOT run above: it needs a server certificate, which the
+  # stock postgres image has none of. It runs against the local harness instead —
+  # `sh scripts/run-tests.sh` — which generates a self-signed cert and turns ssl on.
+  # Naming that here rather than making the test skip itself: a TLS test that
+  # silently passes when there is no TLS is worse than no TLS test.
+  tls:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install milo
+        run: |
+          mkdir -p "$HOME/.milo-bin"
+          curl -fsSL https://github.com/milo-language/milo/releases/download/latest/milo-linux-x64.tar.gz \
+            | tar xz -C "$HOME/.milo-bin" --strip-components=1
+          chmod +x "$HOME/.milo-bin/milo"
+          echo "$HOME/.milo-bin" >> "$GITHUB_PATH"
+
+      # The runner ships PostgreSQL but keeps its binaries off PATH.
+      - name: Put initdb/pg_ctl on PATH
+        run: ls -d /usr/lib/postgresql/*/bin | tail -1 >> "$GITHUB_PATH"
+
+      - name: Full local gate (suite + TLS suite + example + psql cross-check)
+        run: sh scripts/run-tests.sh

@@ -6,5 +6,5 @@
   "repository": "github.com/milo-language/milo-postgres",
   "lib": "lib.milo",
   "targets": ["darwin", "linux"],
-  "exclude": ["tests/**", "examples/**", "scripts/**"]
+  "exclude": ["tests/**", "examples/**", "scripts/**", "docs/**"]
 }
