@@ -1293,7 +1293,14 @@ fn readCString(src: &string, off: i64): string {
 
 // SCRAM nonces are printable ASCII with the comma excluded (it separates fields).
 // This alphabet is a conservative subset of that.
-let NONCE_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+// A function, not a module-level `let`: a string-typed global is dropped when this
+// file is consumed as a package (milo repo docs/backlog.md Tier 1 #17), so the
+// published v0.1.0 did not compile for anyone who installed it — while every
+// in-repo test passed, because those import "../lib" and take the local path.
+// Scalar globals are unaffected; the OID_* constants below are fine.
+fn nonceAlphabet(): string {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+}
 
 // A fresh client nonce per connection, from the OS entropy source. The probe in
 // docs/ used a fixed one so the exchange was reproducible while debugging; a fixed
@@ -1302,7 +1309,8 @@ let NONCE_ALPHABET: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 fn makeNonce(): string {
     var out: string = ""
     for _ in 0..24 {
-        out.push(NONCE_ALPHABET[Random.int(NONCE_ALPHABET.len)])
+        let alphabet = nonceAlphabet()
+        out.push(alphabet[Random.int(alphabet.len)])
     }
     return out
 }
