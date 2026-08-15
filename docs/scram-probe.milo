@@ -1,0 +1,118 @@
+// SCRAM-SHA-256 against a real PostgreSQL, in safe Milo. This is the part of the
+// client most worth proving before committing to one: every primitive it needs
+// (pbkdf2, hmac, sha256, base64) already exists in std, but they have to compose
+// byte-exactly or the server just says "password authentication failed" with no
+// clue which step drifted.
+from "std/net" import { TcpStream, ip4 }
+from "std/binary" import { Bytes }
+from "std/hmac" import { Hmac }
+from "std/sha256" import { Sha256 }
+from "std/pbkdf2" import { Pbkdf2 }
+from "std/base64" import { Base64 }
+
+fn xorBytes(a: &string, b: &string): string {
+    var out: string = ""
+    for i in 0..a.len {
+        out.push(a[i] ^ b[i])
+    }
+    return out
+}
+
+fn field(msg: &string, key: u8): string {
+    // SCRAM messages are comma-separated `k=v`; pull one value out.
+    var i: i64 = 0
+    while i < msg.len {
+        if msg[i] == key && i + 1 < msg.len && msg[i + 1] == '=' {
+            var v: string = ""
+            var j: i64 = i + 2
+            while j < msg.len && msg[j] != ',' {
+                v.push(msg[j])
+                j = j + 1
+            }
+            return v
+        }
+        while i < msg.len && msg[i] != ',' {
+            i = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn startup(): string {
+    var body: string = ""
+    Bytes.writeI32Be(body, 196608)
+    for k in ["user", "postgres", "database", "milo_test"] {
+        body = body + k
+        body.push(0 as u8)
+    }
+    body.push(0 as u8)
+    var pkt: string = ""
+    Bytes.writeI32Be(pkt, (body.len + 4) as i32)
+    return pkt + body
+}
+
+fn tagged(tag: u8, payload: &string): string {
+    var out: string = ""
+    out.push(tag)
+    Bytes.writeI32Be(out, (payload.len + 4) as i32)
+    return out + payload
+}
+
+fn main(): i32 {
+    let s = TcpStream.connect(ip4(127, 0, 0, 1), 55432)!
+    let _a = s.send(startup())!
+    let r1 = s.recvOnce()
+    print("1. auth code: " + (Bytes.readI32Be(r1, 5) ?? -1).toString() + " (10 = SASL)")
+
+    // client-first
+    let nonce = "milofixednonce123456"
+    let bare = "n=,r=" + nonce
+    var initial: string = "SCRAM-SHA-256"
+    initial.push(0 as u8)
+    let gs2 = "n,,"
+    Bytes.writeI32Be(initial, (gs2.len + bare.len) as i32)
+    initial = initial + gs2 + bare
+    let _b = s.send(tagged('p' as u8, initial))!
+
+    let r2 = s.recvOnce()
+    var serverFirst: string = ""
+    for i in 9..r2.len {
+        serverFirst.push(r2[i])
+    }
+    print("2. server-first: " + serverFirst)
+
+    let combined = field(serverFirst, 'r' as u8)
+    let saltB64 = field(serverFirst, 's' as u8)
+    let iterStr = field(serverFirst, 'i' as u8)
+    var iters: i64 = 0
+    for i in 0..iterStr.len {
+        iters = iters * 10 + ((iterStr[i] - '0') as i64)
+    }
+    let salt = Base64.decode(saltB64)!
+
+    let salted = Pbkdf2.sha256(("testpw").clone(), salt, iters, 32)!
+    let clientKey = Hmac.sha256Bytes(salted, "Client Key")
+    let storedKey = Sha256.bytes(clientKey)
+    let finalNoProof = "c=biws,r=" + combined
+    let authMessage = bare + "," + serverFirst + "," + finalNoProof
+    let clientSig = Hmac.sha256Bytes(storedKey, authMessage)
+    let proof = xorBytes(clientKey, clientSig)
+    let clientFinal = finalNoProof + ",p=" + Base64.encode(proof)
+    let _c = s.send(tagged('p' as u8, clientFinal))!
+
+    let r3 = s.recvOnce()
+    print("3. reply tag: " + r3[0].toString() + " (82 = R)")
+    print("   auth code: " + (Bytes.readI32Be(r3, 5) ?? -1).toString() + " (12 = SASLFinal, then 0 = Ok)")
+    var sawOk: bool = false
+    var p: i64 = 0
+    while p + 5 < r3.len {
+        let len = Bytes.readI32Be(r3, p + 1) ?? 0
+        if r3[p] == 82 as u8 && (Bytes.readI32Be(r3, p + 5) ?? -1) == 0 {
+            sawOk = true
+        }
+        p = p + 1 + (len as i64)
+    }
+    print("4. AuthenticationOk: " + sawOk.toString())
+    return 0
+}

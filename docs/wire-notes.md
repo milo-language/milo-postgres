@@ -34,3 +34,33 @@ auth code **10** = `AuthenticationSASL`, i.e. SCRAM-SHA-256. A stock Homebrew or
 apt install uses `trust` for localhost and answers code 0 (`AuthenticationOk`)
 immediately — under which the entire authentication path never runs and the
 tests prove nothing about it. That is why the harness builds its own cluster.
+
+## SCRAM-SHA-256 is proven, not assumed
+
+`docs/scram-probe.milo` completes the full exchange against a real PostgreSQL 16
+in safe Milo and reaches `AuthenticationOk`. Run it with the harness up:
+
+    sh scripts/test-server.sh start
+    milo run docs/scram-probe.milo
+
+Every primitive comes from std and they compose byte-exactly:
+
+    SaltedPassword  = Pbkdf2.sha256(password, salt, i, 32)
+    ClientKey       = Hmac.sha256Bytes(SaltedPassword, "Client Key")
+    StoredKey       = Sha256.bytes(ClientKey)
+    AuthMessage     = client-first-bare + "," + server-first + "," + client-final-without-proof
+    ClientSignature = Hmac.sha256Bytes(StoredKey, AuthMessage)
+    ClientProof     = ClientKey XOR ClientSignature
+
+Two things the probe hard-codes that a real client must not:
+
+* **The nonce is fixed** (`milofixednonce123456`) so the exchange is reproducible
+  while debugging. A client MUST draw it from `std/random` per connection — a
+  predictable client nonce defeats the point of the challenge.
+* **The password is inline.** It belongs in the connection config, and the
+  `SaltedPassword` derivation is the expensive step (4096 PBKDF2 rounds by
+  default), so a pool should cache it per (password, salt, iterations).
+
+The server's final message carries `v=<ServerSignature>`, which a correct client
+**verifies** — it is what proves the server also knew the stored key, i.e. that
+you are not talking to an impostor. The probe does not check it; the client must.
