@@ -61,7 +61,7 @@ fn testConnectOverScram(): void {
 // — one that ignored the server signature, or never sent a proof at all — would
 // pass every other test in this file.
 fn testWrongPasswordRejected(): void {
-    match Conn.connect("postgres://postgres:definitelynotthepassword@127.0.0.1:55432/milo_test") {
+    match Conn.connect(dsnAs("postgres", "definitelynotthepassword")) {
         Result.Ok(_) => {
             assertMsg(false, "a wrong password was accepted")
         }
