@@ -1268,7 +1268,7 @@ impl PgStream {
 fn frame(tag: u8, payload: &string): string {
     var out: string = ""
     out.push(tag)
-    Bytes.writeI32Be(out, (payload.len + 4) as i32)
+    Bytes.writeI32Be(&mut out, (payload.len + 4) as i32)
     out.pushStr(payload)
     return out
 }
@@ -1406,11 +1406,11 @@ fn scramAuth(st: &mut PgStream, cfg: &Dsn, saslBody: &string): Result<Unit, PgEr
     let nonce = makeNonce()
     let bare = "n=,r=" + nonce
     var initial: string = ""
-    pushCString(initial, "SCRAM-SHA-256")
+    pushCString(&mut initial, "SCRAM-SHA-256")
     let gs2 = "n,,"
     // "n,," = this client does not support channel binding. It is part of the
     // AuthMessage the server hashes, so it cannot be adjusted independently.
-    Bytes.writeI32Be(initial, (gs2.len + bare.len) as i32)
+    Bytes.writeI32Be(&mut initial, (gs2.len + bare.len) as i32)
     initial.pushStr(gs2)
     initial.pushStr(bare)
     st.sendAll(frame('p', initial))?
@@ -1507,7 +1507,7 @@ fn authenticate(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
                 return Result.Err(PgError.client("server requested a cleartext password but the DSN carries none"))
             }
             var p: string = ""
-            pushCString(p, cfg.password)
+            pushCString(&mut p, cfg.password)
             st.sendAll(frame('p', p))?
         } else if code == 5 {
             if cfg.password.len == 0 {
@@ -1517,10 +1517,10 @@ fn authenticate(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
                 return Result.Err(PgError.protocol("AuthenticationMD5Password without a 4-byte salt"))
             }
             var p: string = ""
-            pushCString(p, md5Response(cfg.user, cfg.password, m.body.substr(4, 8)))
+            pushCString(&mut p, md5Response(cfg.user, cfg.password, m.body.substr(4, 8)))
             st.sendAll(frame('p', p))?
         } else if code == 10 {
-            scramAuth(st, cfg, m.body)?
+            scramAuth(&mut st, cfg, m.body)?
         } else {
             return Result.Err(PgError.client("unsupported authentication method: " + authMethodName(code) + " — this client implements SCRAM-SHA-256, MD5, cleartext and trust"))
         }
@@ -1581,7 +1581,7 @@ impl Conn {
         }
         var st = PgStream.wrap(tcp)
         if cfg.sslmode != "disable" {
-            match negotiateTls(st, cfg) {
+            match negotiateTls(&mut st, cfg) {
                 Result.Ok(_) => {
                 }
                 Result.Err(e) => {
@@ -1605,25 +1605,25 @@ impl Conn {
 
         var body: string = ""
         // Protocol version 3.0, as major<<16 | minor.
-        Bytes.writeI32Be(body, 196608 as i32)
-        pushCString(body, "user")
-        pushCString(body, cfg.user)
-        pushCString(body, "database")
-        pushCString(body, cfg.database)
-        pushCString(body, "application_name")
-        pushCString(body, cfg.appName)
-        pushCString(body, "client_encoding")
-        pushCString(body, "UTF8")
+        Bytes.writeI32Be(&mut body, 196608 as i32)
+        pushCString(&mut body, "user")
+        pushCString(&mut body, cfg.user)
+        pushCString(&mut body, "database")
+        pushCString(&mut body, cfg.database)
+        pushCString(&mut body, "application_name")
+        pushCString(&mut body, cfg.appName)
+        pushCString(&mut body, "client_encoding")
+        pushCString(&mut body, "UTF8")
         // The parameter LIST needs its own terminator after the last pair. Without
         // it the server answers ErrorResponse with no hint that this is the cause
         // — see docs/wire-notes.md.
         body.push(0 as u8)
         var pkt: string = ""
-        Bytes.writeI32Be(pkt, (body.len + 4) as i32)
+        Bytes.writeI32Be(&mut pkt, (body.len + 4) as i32)
         pkt.pushStr(body)
         // The startup packet has no tag byte; every later message does.
         st.sendAll(pkt)?
-        authenticate(st, cfg)?
+        authenticate(&mut st, cfg)?
 
         var c = Conn {
             stream: st, params: HashMap.new(), notices: Vec.new(),
@@ -1640,7 +1640,7 @@ impl Conn {
     fn query(self: &mut Self, sql: &string): Result<Rows, PgError> {
         self.requireOpen()?
         var body: string = ""
-        pushCString(body, sql)
+        pushCString(&mut body, sql)
         self.stream.sendAll(frame('Q', body))?
         return self.collect()
     }
@@ -1665,8 +1665,8 @@ impl Conn {
         // Parse — unnamed statement, no declared parameter types.
         var p: string = ""
         p.push(0 as u8)
-        pushCString(p, sql)
-        Bytes.writeI16Be(p, 0 as i16)
+        pushCString(&mut p, sql)
+        Bytes.writeI16Be(&mut p, 0 as i16)
         out.pushStr(frame('P', p))
 
         // Bind — unnamed portal from the unnamed statement.
@@ -1675,27 +1675,27 @@ impl Conn {
         b.push(0 as u8)
         // Zero parameter format codes = every parameter is text. Same below for
         // results: text format for v0.1 (see the file header).
-        Bytes.writeI16Be(b, 0 as i16)
+        Bytes.writeI16Be(&mut b, 0 as i16)
         // The count field is 16 bits and `as i16` would wrap silently past 32767,
         // producing a Bind the server reads as a different query. PostgreSQL's own
         // limit is 65535, so refuse above that rather than truncate.
         if params.len() > 65535 {
             return Result.Err(PgError.client("too many bind parameters: " + params.len().toString() + " (PostgreSQL allows 65535)"))
         }
-        Bytes.writeU16Be(b, params.len() as u16)
+        Bytes.writeU16Be(&mut b, params.len() as u16)
         for v in params {
             if v.isNull() {
                 // -1 length is NULL. An empty value is length 0 — the two are
                 // different on the wire, which is what keeps them different in a
                 // result set.
-                Bytes.writeI32Be(b, -1 as i32)
+                Bytes.writeI32Be(&mut b, -1 as i32)
             } else {
                 let text = v.toWire()
-                Bytes.writeI32Be(b, text.len as i32)
+                Bytes.writeI32Be(&mut b, text.len as i32)
                 b.pushStr(text)
             }
         }
-        Bytes.writeI16Be(b, 0 as i16)
+        Bytes.writeI16Be(&mut b, 0 as i16)
         out.pushStr(frame('B', b))
 
         // Describe the portal, so a RowDescription comes back and results decode.
@@ -1708,7 +1708,7 @@ impl Conn {
         // get ReadyForQuery.
         var e: string = ""
         e.push(0 as u8)
-        Bytes.writeI32Be(e, 0 as i32)
+        Bytes.writeI32Be(&mut e, 0 as i32)
         out.pushStr(frame('E', e))
         out.pushStr(frame('S', ""))
 
@@ -1887,7 +1887,7 @@ impl Conn {
                 // waiting for copy data; CopyFail is what unwedges it, and without
                 // that the connection hangs rather than erroring.
                 var reason: string = ""
-                pushCString(reason, "COPY is not supported by milo-postgres")
+                pushCString(&mut reason, "COPY is not supported by milo-postgres")
                 let _ = self.stream.sendAll(frame('f', reason))
                 err = PgError.client("COPY is not supported in v0.1")
                 failed = true
@@ -1927,10 +1927,10 @@ fn affectedFromTag(tag: &string): i64 {
 // CA (the usual reason people reach for unverified TLS) is trusted instead.
 fn negotiateTls(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
     var req: string = ""
-    Bytes.writeI32Be(req, 8 as i32)
+    Bytes.writeI32Be(&mut req, 8 as i32)
     // 1234 << 16 | 5679, the SSLRequest code. It occupies the version field, which
     // is why this has to go out before the startup packet and not after.
-    Bytes.writeI32Be(req, 80877103 as i32)
+    Bytes.writeI32Be(&mut req, 80877103 as i32)
     st.sendAll(req)?
     if !st.ensure(1) {
         return Result.Err(PgError.client("connection closed during SSL negotiation"))

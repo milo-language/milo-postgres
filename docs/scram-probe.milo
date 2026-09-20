@@ -53,21 +53,21 @@ fn field(msg: &string, key: u8): string {
 
 fn startup(): string {
     var body: string = ""
-    Bytes.writeI32Be(body, 196608)
+    Bytes.writeI32Be(&mut body, 196608)
     for k in ["user", "postgres", "database", "milo_test"] {
         body = body + k
         body.push(0 as u8)
     }
     body.push(0 as u8)
     var pkt: string = ""
-    Bytes.writeI32Be(pkt, (body.len + 4) as i32)
+    Bytes.writeI32Be(&mut pkt, (body.len + 4) as i32)
     return pkt + body
 }
 
 fn tagged(tag: u8, payload: &string): string {
     var out: string = ""
     out.push(tag)
-    Bytes.writeI32Be(out, (payload.len + 4) as i32)
+    Bytes.writeI32Be(&mut out, (payload.len + 4) as i32)
     return out + payload
 }
 
@@ -83,7 +83,7 @@ fn main(): i32 {
     var initial: string = "SCRAM-SHA-256"
     initial.push(0 as u8)
     let gs2 = "n,,"
-    Bytes.writeI32Be(initial, (gs2.len + bare.len) as i32)
+    Bytes.writeI32Be(&mut initial, (gs2.len + bare.len) as i32)
     initial = initial + gs2 + bare
     let _b = s.send(tagged('p' as u8, initial))!
 
