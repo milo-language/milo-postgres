@@ -1135,12 +1135,16 @@ struct PgMsg {
 
 // The socket plus a read buffer, so a caller never sees a half message.
 //
-// `tls` is None until an SSLRequest is accepted; at that point the TcpStream's fd
-// is handed over with `take()` (which sets it to -1) so exactly one of the two
-// owns the descriptor and it cannot be double-closed.
+// One variant owns the socket at a time: an accepted SSLRequest moves the
+// TcpStream into TlsStream.fromTcp, so the descriptor has exactly one closer.
+enum Transport {
+    Plain(TcpStream),
+    Tls(TlsStream),
+    Closed,
+}
+
 struct PgStream {
-    tcp: TcpStream,
-    tls: Option<TlsStream>,
+    conn: Transport,
     buf: string,
     pos: i64,
 }
@@ -1148,7 +1152,7 @@ struct PgStream {
 impl PgStream {
     fn wrap(tcp: TcpStream): PgStream {
         return PgStream {
-            tcp: tcp, tls: Option.None, buf: "", pos: 0
+            conn: Transport.Plain(tcp), buf: "", pos: 0
         }
     }
 
@@ -1164,18 +1168,23 @@ impl PgStream {
             if sent > 0 {
                 chunk = data.substr(sent, data.len)
             }
-            var n: i64 = 0
-            if let Option.Some(t) = self.tls {
-                n = if sent == 0 {
-                    t.send(data) ?? -1
-                } else {
-                    t.send(chunk) ?? -1
+            var n: i64 = -1
+            match self.conn {
+                Transport.Tls(t) => {
+                    n = if sent == 0 {
+                        t.send(data) ?? -1
+                    } else {
+                        t.send(chunk) ?? -1
+                    }
                 }
-            } else {
-                n = if sent == 0 {
-                    self.tcp.send(data) ?? -1
-                } else {
-                    self.tcp.send(chunk) ?? -1
+                Transport.Plain(c) => {
+                    n = if sent == 0 {
+                        c.send(data) ?? -1
+                    } else {
+                        c.send(chunk) ?? -1
+                    }
+                }
+                Transport.Closed => {
                 }
             }
             if n <= 0 {
@@ -1191,10 +1200,15 @@ impl PgStream {
     // One read into the buffer. False means the peer closed.
     fn fill(self: &mut Self): bool {
         var chunk: string = ""
-        if let Option.Some(t) = self.tls {
-            chunk = t.recvOnce()
-        } else {
-            chunk = self.tcp.recvOnce()
+        match self.conn {
+            Transport.Tls(t) => {
+                chunk = t.recvOnce()
+            }
+            Transport.Plain(c) => {
+                chunk = c.recvOnce()
+            }
+            Transport.Closed => {
+            }
         }
         if chunk.len == 0 {
             return false
@@ -1254,10 +1268,7 @@ impl PgStream {
     // Close the socket. Assigning over the fields runs the old values' Drop, which
     // is what actually closes the descriptor — there is no explicit close to call.
     fn shutdown(self: &mut Self): void {
-        self.tls = Option.None
-        self.tcp = TcpStream {
-            fd: -1 as i32
-        }
+        self.conn = Transport.Closed
         self.buf = ""
         self.pos = 0
     }
@@ -1956,13 +1967,15 @@ fn negotiateTls(st: &mut PgStream, cfg: &Dsn): Result<Unit, PgError> {
     }
     st.buf = ""
     st.pos = 0
-    // take() hands the descriptor to the TlsStream and leaves the TcpStream at -1,
-    // so exactly one of them closes it.
-    let fd = st.tcp.take()
-    let Result.Ok(tls) = TlsStream.fromFd(fd, cfg.host, cfg.sslrootcert) else {
+    // fromTcp consumes the socket (and closes it if the handshake fails), so the
+    // stream is Closed until the handshake hands back its owner.
+    let Transport.Plain(tcp) = replace(st.conn, Transport.Closed) else {
+        return Result.Err(PgError.client("SSL negotiation on a connection that is not plain TCP"))
+    }
+    let Result.Ok(tls) = TlsStream.fromTcp(tcp, cfg.host, cfg.sslrootcert) else {
         return Result.Err(PgError.client("TLS handshake with " + cfg.host + " failed (certificate not trusted, or hostname mismatch — set sslrootcert= for a private CA)"))
     }
-    st.tls = Option.Some(tls)
+    st.conn = Transport.Tls(tls)
     return Result.Ok(Unit {
     }
     )
