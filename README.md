@@ -24,7 +24,7 @@ Full API, the type mapping, error fields and TLS behaviour:
 ## Installation
 
 ```bash
-milo add github.com/milo-language/milo-postgres
+milo pkg add github.com/milo-language/milo-postgres
 ```
 
 ```milo
